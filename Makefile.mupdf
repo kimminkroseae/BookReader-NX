@@ -66,7 +66,6 @@ DEFINES := \
 # libjpeg comes from the Switch portlibs (libjpeg-turbo) so the app contains a
 # single JPEG implementation; MuPDF's bundled libjpeg 9 clashed with it.
 INCLUDES := \
-	-I$(DEVKITPRO_UNIX)/portlibs/switch/include \
 	-Imupdf/include \
 	-Imupdf/generated \
 	-Imupdf/scripts/freetype \
@@ -75,7 +74,8 @@ INCLUDES := \
 	-Imupdf/thirdparty/jbig2dec \
 	-Imupdf/thirdparty/mujs \
 	-Imupdf/thirdparty/openjpeg/src/lib/openjp2 \
-	-Imupdf/thirdparty/zlib
+	-Imupdf/thirdparty/zlib \
+	-idirafter $(DEVKITPRO_UNIX)/portlibs/switch/include
 
 # ── Флаги компиляции ────────────────────────────────────────────────────────
 CFLAGS := $(ARCH) -O2 -Wno-error -std=gnu11 $(DEFINES) $(INCLUDES)
