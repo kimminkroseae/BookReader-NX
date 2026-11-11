@@ -1,134 +1,130 @@
-# WookReader
+# BookReader-NX
 
-A comic and e-book reader for the Nintendo Switch.
+A manga, comic and e-book reader for the Nintendo Switch homebrew menu.
 
-Fork of eBookReaderSwitch with major improvements to performance, format support, and usability.
-
-## Features
-
-- **Format support:** PDF, EPUB, XPS, CBZ, CBR, CBT, CB7
-- **Reading modes:** Portrait, Landscape, Vertical (fit-to-width), Spread (two-page comics)
-- **Cover grid browser** with folder navigation and thumbnail previews
-- **Recently Opened** virtual folder at root for quick access to the last 20 books
-- **Async prefetch** — next/previous pages pre-rendered for instant page turns
-- **Raw image LRU cache** — revisited pages load instantly
-- **Early first-page display** — cover shown in ~0.5s while large archives enumerate in background
-- **Page-name disk cache** — second+ open of any comic skips enumeration entirely
-- **RAR3 fast enumeration** — header-only scan (~50ms for 500MB solid RAR)
-- **Progressive navigation** — flip through pages while archive is still scanning
-- **Analog stick scrolling** — full 360° proportional panning with left stick
-- **Pinch-to-zoom** and right-stick zoom
-- **Swipe gestures** — swipe to turn pages (direction matches current reading mode)
-- **Screen navigation buttons** — on-screen previous/next overlays, auto-fade after 3 s
-- **Pan locking** — panning disabled when page fits the screen (no blank-space dragging)
-- **Notes per book** — attach freeform text notes to any book or comic
-- **Dark and light mode**
-- **Natural sort** — files sort as 1, 2, 11 (not 1, 11, 2)
-- **Saves last page, orientation, and dark mode settings**
-- **Sorted file browser** (folders first A-Z, files A-Z, case-insensitive)
+BookReader is a rework of [WookReader](https://github.com/exorevan/WookReader) by
+exorevan (itself a fork of eBookReaderSwitch) with a new interface, auto-rotation,
+a manga-aware dark mode, chapter continuation and an in-RAM page cache.
 
 ## Installation
 
-1. Copy `WookReader.nro` to `/switch/WookReader/` on the SD card
-2. Put your comics and books in folders inside `/switch/WookReader/`
+1. Copy `BookReader.nro` to **`/switch/BookReader.nro`** on the SD card.
+2. Put your books, comics and folders in **`/switch/.BookReader/books/`**.
+   The data folder starts with a dot so the homebrew menu doesn't list it.
+   (Windows shows dot-folders normally; on macOS press Cmd+Shift+. to see it.)
+3. Optional: copy `BookReader.cfg` to `/config/nx-hbmenu/fileassoc/` to open
+   files straight from the homebrew menu.
 
-## Controls
+Upgrading from WookReader moves `/switch/.WookReader/`, `/switch/WookReader/`
+or `/switch/eBookReader/` into the new hidden folder automatically on first start
+(books, reading progress, notes and settings are kept). Delete the old `.nro`.
 
-### Navigation
+## Formats
 
-| Input | Portrait / Vertical | Landscape |
-|---|---|---|
-| D-Pad Left / Right | Prev / Next page | Prev / Next page |
-| D-Pad Up | Zoom max | Prev page |
-| D-Pad Down | Zoom out | Next page |
-| ZL / ZR | Prev / Next page | Zoom out / Zoom in |
-| R+ZR / L+ZL | Skip 9 pages forward/back | Skip 9 pages forward/back |
-| SR / SL (Joy-Con) | Skip 10 pages forward/back | Skip 10 pages forward/back |
-| Right Stick Up/Down | Zoom in / out | Prev / Next page |
+| Kind | Extensions |
+|---|---|
+| Comics / manga | CBZ, CBR, CB7, CBT, ZIP, RAR, 7Z, TAR, a folder of images |
+| Images inside | JPEG, PNG, WebP, GIF, BMP |
+| Documents | PDF, XPS/OXPS |
+| Reflowable books | EPUB, FB2, XHTML/HTML, TXT (re-flowed to the screen; text size in Settings) |
 
-### View
+A folder containing loose images shows a **"Read the images in this folder"** card.
+
+## Dark mode, manga and books
+
+Dark mode makes all backgrounds black. Pages are treated by type:
+
+- **Manga / comic:** artwork is left untouched (colour pages stay colour), the
+  area around the page is black.
+- **Book:** brightness is inverted (white paper turns black, black text turns
+  white) while colours keep their hue.
+
+Press **X** in the library to mark a **folder** (applies to everything inside,
+including sub-folders) or a single **file**. A file with no type asks you the
+first time you open it (can be turned off in Settings).
+
+## Speed and memory
+
+When a book opens, BookReader keeps working ahead in the background:
+
+- Comic archives are copied into RAM (when they fit), so pages never wait on the SD card.
+- Pages are decoded / rendered ahead of you into RAM, nearest pages first, up to a
+  memory budget based on the free memory. Most chapters fit entirely, so every
+  page turn (and slider jump) becomes instant after a few seconds.
+- Everything is freed as soon as the book is closed.
+
+**Launch through title-override** (hold R while starting any game). In applet
+mode (from the Album) the app only gets a few hundred MB, so the cache is kept
+small; the library shows an "APPLET MODE" tag and a one-time notice.
+
+## Chapters
+
+Turning past the last page shows the next book in the folder; turn again to open
+it. Turning back from the first page offers the previous one, opened at its last
+page. The **Continue reading** card at the top of the library reopens your last
+book where you left off, or shows **Up next** once it is finished.
+
+## Rotation
+
+Hold the Switch upright like a book and the page rotates with it (motion sensor,
+handheld mode). You can lock the rotation in Settings or the reader menu. If
+pages come out upside down, set *Settings → Rotation → Auto-rotate direction* to
+*Reversed*. Touch, D-pad and sticks all follow the rotation.
+
+## Reader controls
 
 | Input | Action |
 |---|---|
-| Left Stick | Analog scroll 360° (panning disabled when page fits screen) |
-| Left / Right Stick click | Reset view (zoom + pan) |
-| Y | Cycle layout: Portrait → Landscape → Vertical → Portrait |
-| X | Toggle status bar |
-| Minus | Toggle dark / light mode |
+| ZR / R / tap right side | Next page (scrolls first on tall pages) |
+| ZL / L / tap left side | Previous page |
+| D-pad | Turn pages / scroll (follows rotation and manga direction) |
+| Swipe sideways | Turn page (when the page fits the width) |
+| Left stick | Flick to turn pages; moves around a zoomed page |
+| Drag | Move around a zoomed page |
+| Right stick up/down / pinch | Zoom |
+| Stick click | Reset zoom |
+| Y | Fit page → Fit width → Two pages (comics) |
+| X / tap middle | Show/hide the top bar (with page slider) |
+| A | Go to page |
+| − | Dark mode |
+| + | Reader menu (rotation, fit, manga/book, direction, notes, …) |
+| B | Close book |
 
-### Touch
-
-| Gesture | Portrait / Vertical | Landscape |
-|---|---|---|
-| Drag (1 finger) | Scroll / pan | Scroll / pan |
-| Pinch (2 fingers) | Zoom | Zoom |
-| Swipe left/right (≥180 px) | Next / Prev page | — |
-| Swipe up/down (≥180 px) | — | Prev / Next page |
-| Tap left or right edge | Prev / Next page | — |
-| Tap top or bottom edge | — | Prev / Next page |
-
-> Screen navigation buttons (if enabled in Options) follow the same left/right ↔ top/bottom axis as the current layout.
-
-### Other
+## Library controls
 
 | Input | Action |
 |---|---|
-| A | Go to page (number pad) |
-| L | Open notes overlay for current book |
-| A (notes open) | Edit note via on-screen keyboard |
-| B | Exit notes overlay / exit reader |
-| Plus | Toggle help overlay |
-
-## Options
-
-Open Options from the file browser with the **Plus** button.
-
-| Option | Default | Description |
-|---|---|---|
-| Scroll Speed | — | Left-stick and D-pad scroll distance per tick |
-| Zoom Amount | — | Zoom step for ZL/ZR and D-pad zoom actions |
-| Dark Mode | Off | Invert page colours |
-| Status Bar | On | Show page number and zoom level at bottom of screen |
-| Screen Buttons | Off | On-screen previous/next buttons that fade after 3 s |
-
-## Screenshots
-
-Dark Mode Folders:
-
-<img src="screenshots/NewDarkModeFolder.jpg" width="512" height="288">
-
-Dark Mode Reading:
-
-<img src="screenshots/NewDarkModeBook.jpg" width="512" height="288">
-
-Dark Mode Options:
-
-<img src="screenshots/NewDarkModeOptions.jpg" width="512" height="288">
-
-Light Mode Folders:
-
-<img src="screenshots/NewLightModeFolders.jpg" width="512" height="288">
-
-Light Mode Reading:
-
-<img src="screenshots/NewLightModeBook.jpg" width="512" height="288">
+| D-pad / stick / touch | Move, scroll (with momentum) |
+| A / tap | Open |
+| B | Back / exit |
+| X | Mark folder or file as manga / book |
+| Y | Notes for a book |
+| ZL / ZR | More / fewer covers per row |
+| − | Light / dark theme |
+| + | Settings |
 
 ## Building
 
-Requires [devkitPro](https://devkitpro.org/) with devkitA64 and Switch portlibs:
+Requires devkitPro (devkitA64, libnx, Switch portlibs). On Arch Linux:
 
 ```
-pacman -S libnx switch-portlibs
+bash tools/install_devkitpro.sh   # once
+bash tools/build.sh              # produces BookReader.nro in the project folder
 ```
 
-Build:
-
-```
-bash build_cbz.sh
-```
+`tools/build.sh` builds in `~/.cache/wookreader-build` because devkitPro's
+makefiles break on paths containing characters like `&`. The first build also
+compiles MuPDF (a few minutes); later builds are incremental.
 
 ## Credits
 
-- moronigranja — expanded file format support
+- [WookReader](https://github.com/exorevan/WookReader) by exorevan — the base this project is built on
+- eBookReaderSwitch and moronigranja — original reader and expanded format support
 - NX-Shell Team — original application code base
 - Papirus Icon Theme — folder/file icon design inspiration
+- [MuPDF](https://mupdf.com/) (Artifex) — PDF/EPUB/XPS rendering
+
+## License
+
+GPL-2.0 (see `LICENSE`), as inherited from WookReader. The bundled MuPDF source
+in `mupdf/` is licensed under the AGPL-3.0 (see `mupdf/COPYING`).

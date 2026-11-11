@@ -17,7 +17,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 # INCLUDES is a list of directories containing header files
 # ROMFS is the directory containing data to be added to RomFS, relative to the Makefile (Optional)
 #---------------------------------------------------------------------------------
-TARGET		:=	WookReader
+TARGET		:=	BookReader
 BUILD		:=	build
 SOURCES		:=	source source/menus/book source/menus/book-chooser source/helpers
 DATA		:=	data
@@ -25,12 +25,12 @@ INCLUDES    :=  include include/menus/book include/menus/book-chooser include/he
 ROMFS	    :=	romfs
 
 VERSION_MAJOR := 0
-VERSION_MINOR := 6
-VERSION_MICRO := 7
+VERSION_MINOR := 7
+VERSION_MICRO := 0
 
-APP_TITLE   := WookReader
-APP_AUTHOR  := exorevan
-APP_VERSION := ${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_MICRO}-sigma
+APP_TITLE   := BookReader
+APP_AUTHOR  := kimminkroseae (WookReader by exorevan)
+APP_VERSION := ${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_MICRO}
 ICON := icon.jpg
 
 #---------------------------------------------------------------------------------
@@ -41,7 +41,7 @@ ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 			$(ARCH) $(DEFINES)
 
-CFLAGS	+=	-D__SWITCH__ $(INCLUDE) `sdl2-config --cflags`
+CFLAGS	+=	-D__SWITCH__ $(INCLUDE) `sdl2-config --cflags` -DAPP_VERSION_STR="\"$(APP_VERSION)\""
 
 CXXFLAGS	:= $(CFLAGS) -std=c++17 -fno-rtti -fno-exceptions
 
@@ -67,7 +67,7 @@ LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*
 #
 #  - mujs/one.c исключён из Makefile.mupdf (см. там) — это устраняет
 #    дублирование js* символов внутри самой libmupdf.a.
-LIBS_REAL = stdc++fs SDL2_ttf SDL2_image png harfbuzz freetype jpeg turbojpeg webp archive lzma lz4 zstd bz2 config nx m
+LIBS_REAL = stdc++fs SDL2_gfx SDL2_ttf SDL2_image png harfbuzz freetype jpeg turbojpeg webp archive lzma lz4 zstd bz2 config nx m
 
 ifeq (,$(NODEBUG))
 #LIBS_REAL += twili
@@ -203,8 +203,8 @@ $(BUILD): $(CURDIR)/lib/libmupdf.a
 
 # Сборка libmupdf.a через Makefile.switch из корня проекта
 $(CURDIR)/lib/libmupdf.a:
-	@echo ">>> Сборка libmupdf.a ..."
-	@$(MAKE) -f $(CURDIR)/Makefile.switch
+	@echo ">>> Building libmupdf.a ..."
+	@$(MAKE) -f $(CURDIR)/Makefile.mupdf
 
 #---------------------------------------------------------------------------------
 clean:
@@ -218,12 +218,12 @@ endif
 #---------------------------------------------------------------------------------
 mupdf-clean:
 	@echo cleaning mupdf ...
-	@$(MAKE) -f $(CURDIR)/Makefile.switch clean
+	@$(MAKE) -f $(CURDIR)/Makefile.mupdf clean
 
 #---------------------------------------------------------------------------------
 # Ручная пересборка только libmupdf.a (без пересборки всего проекта)
 mupdf:
-	@$(MAKE) -f $(CURDIR)/Makefile.switch
+	@$(MAKE) -f $(CURDIR)/Makefile.mupdf
 
 #---------------------------------------------------------------------------------
 else

@@ -1,357 +1,164 @@
+// Library browser + Settings page.
+
 extern "C" {
 #include "MenuChooser.h"
-
 #include "SDL_helper.h"
 #include "common.h"
-#include "config.h"
 #include "fs.h"
-#include "menu_book_reader.h"
 #include "textures.h"
 }
 
 #include <SDL2/SDL_image.h>
-#include <bits/stdc++.h>
-#include <libconfig.h>
-#include <switch.h>
 #include <archive.h>
 #include <archive_entry.h>
+#include <dirent.h>
 #include <mupdf/fitz.h>
-#include "../book/stb_image.h"  // declarations only (implementation in CBZPageLayout.cpp)
+#include <switch.h>
+#include <sys/stat.h>
 #include <turbojpeg.h>
 
-#include <filesystem>
-#include <iostream>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <functional>
+#include <list>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "../book/stb_image.h"  // declarations only (implementation in CBZPageLayout.cpp)
+#include "library.h"
+#include "memory_mode.h"
+#include "menu_book_reader.h"
+#include "mupdf_ctx.h"
+#include "natsort.h"
+#include "orientation.h"
+#include "paths.h"
+#include "settings.h"
+#include "ui.h"
 
 using namespace std;
-namespace fs = filesystem;
 
-extern void Log_Write(const std::string& msg);
-extern void Log_Error(const std::string& msg);
-extern fz_context *ctx;
-extern config_t*   config;
-extern const char* configFile;
+extern void Log_Write(const std::string &msg);
+extern void Log_Error(const std::string &msg);
 
-// ── Per-comic notes helpers ───────────────────────────────────────────────────
-static const char* CHOOSER_NOTES_DIR = "/switch/WookReader/.notes";
+#ifndef APP_VERSION_STR
+#define APP_VERSION_STR "dev"
+#endif
 
-static string chooser_sanitize(const string& fpath) {
-  string name = fpath.substr(fpath.find_last_of("/\\") + 1);
-  const string bad = " :/?#[]@!$&'()*+,;=.";
-  for (char c : bad)
-    name.erase(remove(name.begin(), name.end(), c), name.end());
-  return name;
-}
+// ── Thumbnail helpers (worker-thread safe: no renderer access) ──────────────
 
-static string chooser_note_path(const string& fpath) {
-  return string(CHOOSER_NOTES_DIR) + "/" + chooser_sanitize(fpath) + ".txt";
-}
-
-static bool chooser_note_exists(const string& fpath) {
-  return FS_FileExists(chooser_note_path(fpath).c_str());
-}
-
-static string chooser_note_read(const string& fpath) {
-  string p = chooser_note_path(fpath);
-  FILE* f = fopen(p.c_str(), "r");
-  if (!f) return "";
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f); fseek(f, 0, SEEK_SET);
-  if (sz <= 0) { fclose(f); return ""; }
-  string text((size_t)sz, '\0');
-  size_t got = fread(&text[0], 1, (size_t)sz, f);
-  fclose(f);
-  text.resize(got);
-  text.erase(remove(text.begin(), text.end(), '\r'), text.end());
-  return text;
-}
-
-static void chooser_note_save(const string& fpath, const string& text) {
-  FS_RecursiveMakeDir(CHOOSER_NOTES_DIR);
-  string p = chooser_note_path(fpath);
-  if (text.empty()) { remove(p.c_str()); return; }
-  FILE* f = fopen(p.c_str(), "w");
-  if (!f) return;
-  fwrite(text.data(), 1, text.size(), f);
-  fclose(f);
-}
-
-// ── Reading history ───────────────────────────────────────────────────────────
-static const char RECENT_FILE[]     = "/switch/WookReader/.recent.lst";
-static const char RECENT_SENTINEL[] = "/WOOK_RECENT";
-static vector<string> g_recent;
-
-static void load_recent() {
-    g_recent.clear();
-    FILE* f = fopen(RECENT_FILE, "r");
-    if (!f) return;
-    char line[512];
-    while ((int)g_recent.size() < 10 && fgets(line, sizeof(line), f)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) len--;
-        if (len > 0) g_recent.push_back(string(line, len));
-    }
-    fclose(f);
-}
-
-static void save_recent() {
-    FILE* f = fopen(RECENT_FILE, "w");
-    if (!f) return;
-    for (const auto& p : g_recent) fprintf(f, "%s\n", p.c_str());
-    fclose(f);
-}
-
-static void update_recent(const string& fpath) {
-    if (!g_recent.empty() && g_recent[0] == fpath) return;  // already at top
-    g_recent.erase(remove(g_recent.begin(), g_recent.end(), fpath), g_recent.end());
-    g_recent.insert(g_recent.begin(), fpath);
-    if ((int)g_recent.size() > 10) g_recent.resize(10);
-    save_recent();
-}
-
-/*This is for the colors array, don't have a great way of calculating it so i
- * use this definition*/
-#define COLORS_SIZE 24
-
-/*Default Scroll Speed*/
-#define SCROLL 3
-
-/*Default Zoom Amount*/
-#define ZOOM 0.3
-
-/*configFile For Options*/
-config_t* optionConfig = NULL;
-const char* optionFile = "/switch/WookReader/options.cfg";
-
-// ── Grid layout ──────────────────────────────────────────────────────────────
-// COLS/CELL_W/CELL_H/THUMB_W/THUMB_H are dynamic (ZL/ZR zoom) — local vars in Menu_StartChoosing
-static const int FOLDER_H = 40;   // folder row height (fixed)
-static const int BOTTOM_H = 70;   // bottom bar height (fixed)
-
-// ── LRU texture cache ─────────────────────────────────────────────────────────
-// Key = "abs_path|cols" — covers are loaded at the right size per zoom level
-// and cached so zoom changes are instant if that level was seen before.
-struct LRUTextureCache {
-  static const int MAX_ENTRIES = 300;
-  list<string> order;  // front = most-recently-used
-  unordered_map<string, pair<SDL_Texture*, list<string>::iterator>> entries;
-
-  SDL_Texture* get(const string& key) {
-    auto it = entries.find(key);
-    if (it == entries.end()) return nullptr;
-    order.erase(it->second.second);
-    order.push_front(key);
-    it->second.second = order.begin();
-    return it->second.first;
+// Crops src to the target aspect ratio (centred) and box-filters it down to
+// tw x th. Returns malloc'd RGBA.
+static unsigned char *crop_fill_rgba(const unsigned char *src, int sw, int sh, int stride, int n,
+                                     int tw, int th) {
+  if (!src || sw <= 0 || sh <= 0 || tw <= 0 || th <= 0) return nullptr;
+  float ta = (float)tw / th, sa = (float)sw / sh;
+  float cx0 = 0, cy0 = 0, cw = (float)sw, ch = (float)sh;
+  if (sa > ta) {
+    cw = sh * ta;
+    cx0 = (sw - cw) / 2;
+  } else {
+    ch = sw / ta;
+    cy0 = (sh - ch) / 2;
   }
-
-  // Stores tex and returns it (nullptr is a no-op).
-  SDL_Texture* put(const string& key, SDL_Texture* tex) {
-    if (!tex) return nullptr;
-    // Evict LRU entries until under the limit
-    while ((int)entries.size() >= MAX_ENTRIES) {
-      SDL_DestroyTexture(entries[order.back()].first);
-      entries.erase(order.back());
-      order.pop_back();
-    }
-    order.push_front(key);
-    entries[key] = {tex, order.begin()};
-    return tex;
-  }
-
-  void clear() {
-    for (auto& [k, v] : entries) SDL_DestroyTexture(v.first);
-    entries.clear();
-    order.clear();
-  }
-};
-static LRUTextureCache g_cover_cache;
-
-template <typename T>
-bool contains(list<T>& listOfElements, const T& element) {
-  auto it = find(listOfElements.begin(), listOfElements.end(), element);
-  return it != listOfElements.end();
-}
-
-extern TTF_Font *ROBOTO_35, *ROBOTO_25, *ROBOTO_15;
-
-static int load_config(unsigned int* chosenFolderColor,
-                       unsigned int* chosenBookColor, int* scroll_speed,
-                       int* zoom_amount, bool* configDarkMode) {
-  if (!optionConfig) {
-    optionConfig = (config_t*)malloc(sizeof(config_t));
-    config_init(optionConfig);
-    config_read_file(optionConfig, optionFile);
-  }
-
-  config_setting_t* folder = config_setting_get_member(
-      config_root_setting(optionConfig), "FolderColor");
-  config_setting_t* book =
-      config_setting_get_member(config_root_setting(optionConfig), "BookColor");
-  config_setting_t* scroll = config_setting_get_member(
-      config_root_setting(optionConfig), "ScrollSpeed");
-  config_setting_t* zoom = config_setting_get_member(
-      config_root_setting(optionConfig), "ZoomAmount");
-  config_setting_t* dark =
-      config_setting_get_member(config_root_setting(optionConfig), "DarkMode");
-
-  if (folder && book && scroll && zoom) {
-    *chosenFolderColor =
-        std::clamp(config_setting_get_int(folder), 0, COLORS_SIZE);
-    *chosenBookColor = std::clamp(config_setting_get_int(book), 0, COLORS_SIZE);
-    *scroll_speed = std::clamp(config_setting_get_int(scroll), 1, 4);
-    *zoom_amount = std::clamp(config_setting_get_int(zoom), 1, 4);
-    *configDarkMode = config_setting_get_bool(dark);
-  }
-
-  config_setting_t* scrbtn =
-      config_setting_get_member(config_root_setting(optionConfig), "ScreenButtons");
-  if (scrbtn) configScreenButtons = config_setting_get_bool(scrbtn);
-
-  config_setting_t* statbar =
-      config_setting_get_member(config_root_setting(optionConfig), "StatusBar");
-  if (statbar) configStatusBar = config_setting_get_bool(statbar);
-
-  return 0;
-}
-
-static void save_config(unsigned int chosenFolderColor,
-                        unsigned int chosenBookColor, int scroll_speed,
-                        int zoom_amount, bool configDarkMode) {
-  config_setting_t* folder = config_setting_get_member(
-      config_root_setting(optionConfig), "FolderColor");
-  config_setting_t* book =
-      config_setting_get_member(config_root_setting(optionConfig), "BookColor");
-  config_setting_t* scroll = config_setting_get_member(
-      config_root_setting(optionConfig), "ScrollSpeed");
-  config_setting_t* zoom = config_setting_get_member(
-      config_root_setting(optionConfig), "ZoomAmount");
-  config_setting_t* dark =
-      config_setting_get_member(config_root_setting(optionConfig), "DarkMode");
-
-  if (!folder || !book || !scroll || !zoom || !dark) {
-    folder = config_setting_add(config_root_setting(optionConfig),
-                                "FolderColor", CONFIG_TYPE_INT);
-    book = config_setting_add(config_root_setting(optionConfig), "BookColor",
-                              CONFIG_TYPE_INT);
-    scroll = config_setting_add(config_root_setting(optionConfig),
-                                "ScrollSpeed", CONFIG_TYPE_INT);
-    zoom = config_setting_add(config_root_setting(optionConfig), "ZoomAmount",
-                              CONFIG_TYPE_INT);
-    dark = config_setting_add(config_root_setting(optionConfig), "DarkMode",
-                              CONFIG_TYPE_BOOL);
-  }
-
-  if (folder && book && scroll && zoom && dark) {
-    config_setting_set_int(folder, chosenFolderColor);
-    config_setting_set_int(book, chosenBookColor);
-    config_setting_set_int(scroll, scroll_speed);
-    config_setting_set_int(zoom, zoom_amount);
-    config_setting_set_bool(dark, configDarkMode);
-  }
-  config_setting_t* scrbtn =
-      config_setting_get_member(config_root_setting(optionConfig), "ScreenButtons");
-  if (!scrbtn)
-    scrbtn = config_setting_add(config_root_setting(optionConfig), "ScreenButtons",
-                                CONFIG_TYPE_BOOL);
-  if (scrbtn)
-    config_setting_set_bool(scrbtn, configScreenButtons);
-
-  config_setting_t* statbar =
-      config_setting_get_member(config_root_setting(optionConfig), "StatusBar");
-  if (!statbar)
-    statbar = config_setting_add(config_root_setting(optionConfig), "StatusBar",
-                                 CONFIG_TYPE_BOOL);
-  if (statbar)
-    config_setting_set_bool(statbar, configStatusBar);
-
-  config_write_file(optionConfig, optionFile);
-}
-
-// Natural sort: compare strings so that embedded numbers sort numerically.
-// "file2" < "file11" < "file20", case-insensitive.
-static bool natural_less(const string& a, const string& b) {
-  size_t i = 0, j = 0;
-  while (i < a.size() && j < b.size()) {
-    bool a_dig = isdigit((unsigned char)a[i]);
-    bool b_dig = isdigit((unsigned char)b[j]);
-    if (a_dig && b_dig) {
-      // Skip leading zeros
-      size_t ai = i, bi = j;
-      while (ai < a.size() && a[ai] == '0') ai++;
-      while (bi < b.size() && b[bi] == '0') bi++;
-      // Find end of digit runs
-      size_t ae = ai, be = bi;
-      while (ae < a.size() && isdigit((unsigned char)a[ae])) ae++;
-      while (be < b.size() && isdigit((unsigned char)b[be])) be++;
-      size_t alen = ae - ai, blen = be - bi;
-      if (alen != blen) return alen < blen;  // more digits = bigger number
-      int cmp = a.compare(ai, alen, b, bi, blen);
-      if (cmp != 0) return cmp < 0;
-      i = ae; j = be;  // digit runs were equal — advance past them
-    } else {
-      char ca = tolower((unsigned char)a[i]);
-      char cb = tolower((unsigned char)b[j]);
-      if (ca != cb) return ca < cb;
-      i++; j++;
+  unsigned char *out = (unsigned char *)malloc((size_t)tw * th * 4);
+  if (!out) return nullptr;
+  for (int ty = 0; ty < th; ty++) {
+    int y0 = (int)(cy0 + ty * ch / th);
+    int y1 = std::max(y0 + 1, (int)ceilf(cy0 + (ty + 1) * ch / th));
+    y1 = std::min(y1, sh);
+    for (int tx = 0; tx < tw; tx++) {
+      int x0 = (int)(cx0 + tx * cw / tw);
+      int x1 = std::max(x0 + 1, (int)ceilf(cx0 + (tx + 1) * cw / tw));
+      x1 = std::min(x1, sw);
+      unsigned r = 0, g = 0, b = 0, cnt = 0;
+      for (int y = y0; y < y1; y++) {
+        const unsigned char *p = src + (size_t)y * stride + (size_t)x0 * n;
+        for (int x = x0; x < x1; x++, p += n) {
+          r += p[0];
+          g += p[1];
+          b += p[2];
+          cnt++;
+        }
+      }
+      unsigned char *o = out + ((size_t)ty * tw + tx) * 4;
+      if (!cnt) cnt = 1;
+      o[0] = (unsigned char)(r / cnt);
+      o[1] = (unsigned char)(g / cnt);
+      o[2] = (unsigned char)(b / cnt);
+      o[3] = 255;
     }
   }
-  return a.size() < b.size();
+  return out;
 }
 
-static vector<fs::path> get_sorted_entries(const string& path,
-                                             list<string> allowedExtentions,
-                                             int *out_num_folders) {
-  // Collect entries with is_directory and lowercase name cached during iteration
-  // to avoid O(N log N) stat() calls in the sort comparator.
-  struct EntryInfo { fs::path p; bool is_dir; string name_lower; };
-  vector<EntryInfo> infos;
-
-  std::error_code ec;
-  for (const auto& entry : fs::directory_iterator(path, ec)) {
-    if (ec) {
-      Log_Error("get_sorted_entries dir_iter error: " + ec.message());
-      break;
+// Decodes an encoded image (JPEG decoded at a reduced scale when possible) and
+// produces a tw x th cover thumbnail.
+static unsigned char *make_thumb_from_encoded(const vector<uint8_t> &data, int tw, int th,
+                                              int *out_iw, int *out_ih) {
+  const uint8_t *d = data.data();
+  size_t n = data.size();
+  unsigned char *px = nullptr;
+  int w = 0, h = 0;
+  if (n >= 2 && d[0] == 0xFF && d[1] == 0xD8) {
+    tjhandle tj = tjInitDecompress();
+    if (tj) {
+      int sub = 0, cs = 0;
+      if (tjDecompressHeader3(tj, d, (unsigned long)n, &w, &h, &sub, &cs) == 0 && w > 0 && h > 0) {
+        int nsf = 0;
+        tjscalingfactor *sf = tjGetScalingFactors(&nsf);
+        float need = fmaxf((float)tw / w, (float)th / h);
+        int bw = w, bh = h;
+        for (int i = 0; sf && i < nsf; i++) {
+          int sw2 = TJSCALED(w, sf[i]), sh2 = TJSCALED(h, sf[i]);
+          if (sw2 >= w * need - 1 && sh2 >= h * need - 1 && sw2 * sh2 < bw * bh) {
+            bw = sw2;
+            bh = sh2;
+          }
+        }
+        px = (unsigned char *)malloc((size_t)bw * bh * 4);
+        if (px && tjDecompress2(tj, d, (unsigned long)n, px, bw, 0, bh, TJPF_RGBA, TJFLAG_FASTDCT) != 0) {
+          free(px);
+          px = nullptr;
+        }
+        w = bw;
+        h = bh;
+      }
+      tjDestroy(tj);
     }
-    std::error_code ec2;
-    bool is_dir = entry.is_directory(ec2);
-    string filename = entry.path().filename().string();
-    string ext;
-    if (filename.find('.') != string::npos)
-      ext = filename.substr(filename.find_last_of("."));
-    else
-      ext = is_dir ? "directory" : "none";
-
-    if (!contains(allowedExtentions, ext)) continue;
-
-    string name_lower = filename;
-    transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
-    infos.push_back({entry.path(), is_dir, std::move(name_lower)});
   }
-
-  // Sort using cached values — zero stat() calls in comparator; natural sort for numbers
-  sort(infos.begin(), infos.end(), [](const EntryInfo& a, const EntryInfo& b) {
-    if (a.is_dir != b.is_dir) return a.is_dir > b.is_dir;
-    return natural_less(a.name_lower, b.name_lower);
-  });
-
-  // Count folders from cached is_dir flags — no extra stat() calls
-  int nf = 0;
-  for (const auto& info : infos) {
-    if (!info.is_dir) break;
-    nf++;
+  if (!px) {
+    int ch = 0;
+    px = stbi_load_from_memory(d, (int)n, &w, &h, &ch, 4);
   }
-  *out_num_folders = nf;
-
-  vector<fs::path> entries;
-  entries.reserve(infos.size());
-  for (auto& info : infos)
-    entries.push_back(std::move(info.p));
-  return entries;
+  if (!px) {
+    SDL_RWops *rw = SDL_RWFromConstMem(d, (int)n);
+    SDL_Surface *s = rw ? IMG_Load_RW(rw, 1) : nullptr;
+    SDL_Surface *c = s ? SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGBA32, 0) : nullptr;
+    if (s) SDL_FreeSurface(s);
+    if (c) {
+      unsigned char *out = crop_fill_rgba((unsigned char *)c->pixels, c->w, c->h, c->pitch, 4, tw, th);
+      SDL_FreeSurface(c);
+      if (out) {
+        *out_iw = tw;
+        *out_ih = th;
+      }
+      return out;
+    }
+    return nullptr;
+  }
+  unsigned char *out = crop_fill_rgba(px, w, h, w * 4, 4, tw, th);
+  free(px);
+  if (out) {
+    *out_iw = tw;
+    *out_ih = th;
+  }
+  return out;
 }
 
 // ── Cover thumbnail loading ───────────────────────────────────────────────────
 
-static const char PAGECACHE_DIR[] = "/switch/WookReader/.pagecache";
 
 // FNV-1a key shared with CBZPageLayout — must stay in sync.
 static uint64_t comic_cache_key(const char* path) {
@@ -369,7 +176,7 @@ static uint64_t comic_cache_key(const char* path) {
 // after a full enumeration. Returns the alphabetically first page name, or "".
 static string cover_name_from_page_cache(const char* path) {
     char lst[512];
-    snprintf(lst, sizeof(lst), "%s/%016llx.lst", PAGECACHE_DIR,
+    snprintf(lst, sizeof(lst), "%s/%016llx.lst2", PAGECACHE_DIR,
              (unsigned long long)comic_cache_key(path));
     FILE* f = fopen(lst, "r");
     if (!f) return "";
@@ -424,6 +231,13 @@ static void save_cover_cache(uint64_t key, const string& name, const vector<uint
     if (fd) { fwrite(data.data(), 1, data.size(), fd); fclose(fd); }
 }
 
+static bool is_junk(const char* name) {
+  if (strstr(name, "__MACOSX/")) return true;
+  const char* base = strrchr(name, '/');
+  base = base ? base + 1 : name;
+  return base[0] == '.' && base[1] == '_';
+}
+
 static bool is_image_file(const char* name) {
   if (!name) return false;
   const char* dot = strrchr(name, '.');
@@ -434,26 +248,6 @@ static bool is_image_file(const char* name) {
   return strcmp(ext, ".jpg")  == 0 || strcmp(ext, ".jpeg") == 0 ||
          strcmp(ext, ".png")  == 0 || strcmp(ext, ".webp") == 0 ||
          strcmp(ext, ".bmp")  == 0 || strcmp(ext, ".gif")  == 0;
-}
-
-// Returns true if name looks like the first page (suffix 0 or 1, or "cover").
-// Used to short-circuit the cover scan for sorted archives.
-static bool looks_like_first_page(const string& name) {
-  // Check for "cover" anywhere in the basename
-  string lower = name;
-  for (char& c : lower) c = (char)tolower((unsigned char)c);
-  if (lower.find("cover") != string::npos) return true;
-  // Check last digit before extension is 0 or 1
-  const char* dot = strrchr(name.c_str(), '.');
-  const char* base = dot ? dot : name.c_str() + name.size();
-  // walk backwards past the digit suffix
-  while (base > name.c_str() && isdigit((unsigned char)*(base - 1))) base--;
-  if (base < (dot ? dot : name.c_str() + name.size())) {
-    // parse the number
-    long num = strtol(base, nullptr, 10);
-    if (num == 0 || num == 1) return true;
-  }
-  return false;
 }
 
 // Scan a RAR3 archive's file headers WITHOUT decompression.
@@ -527,9 +321,9 @@ static string find_cover_in_rar3(const char* path) {
             namebuf[name_size] = '\0';
             for (int i = 0; namebuf[i]; i++)
               if (namebuf[i] == '\\') namebuf[i] = '/';
-            if (is_image_file(namebuf)) {
+            if (is_image_file(namebuf) && !is_junk(namebuf)) {
               string sn(namebuf);
-              if (best.empty() || sn < best) best = sn;
+              if (best.empty() || natural_less(sn, best)) best = sn;
             }
           }
         }
@@ -632,9 +426,9 @@ static unsigned char* extract_cbz_cover_pixels(const char* path, int tw, int th,
         while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
           if (archive_entry_filetype(entry) == AE_IFDIR) { archive_read_data_skip(a); continue; }
           const char* n = archive_entry_pathname(entry);
-          if (!n || !is_image_file(n)) { archive_read_data_skip(a); continue; }
+          if (!n || !is_image_file(n) || is_junk(n)) { archive_read_data_skip(a); continue; }
           string sn(n);
-          if (best_name.empty() || sn < best_name) {
+          if (best_name.empty() || natural_less(sn, best_name)) {
             best_name = sn;
             // Extract this candidate (may be overwritten if a better name found,
             // but most archives have sorted entries so this is usually final)
@@ -657,56 +451,7 @@ static unsigned char* extract_cbz_cover_pixels(const char* path, int tw, int th,
   }
 
   decode:
-
-  // Decode image — use libjpeg-turbo for JPEG (2–3x faster than stb_image on ARM NEON).
-  const uint8_t* d = cover_data.data();
-  bool is_jpeg = (cover_data.size() >= 2 && d[0] == 0xFF && d[1] == 0xD8);
-  int src_w = 0, src_h = 0;
-  unsigned char* src_px = nullptr;
-  if (is_jpeg) {
-    tjhandle tj = tjInitDecompress();
-    if (tj) {
-      int subsamp = 0, cs = 0;
-      if (tjDecompressHeader3(tj, d, (unsigned long)cover_data.size(),
-                              &src_w, &src_h, &subsamp, &cs) == 0) {
-        src_px = (unsigned char*)malloc((size_t)src_w * src_h * 4);
-        if (src_px && tjDecompress2(tj, d, (unsigned long)cover_data.size(),
-                                    src_px, src_w, 0, src_h, TJPF_RGBA,
-                                    TJFLAG_FASTDCT) != 0) {
-          free(src_px); src_px = nullptr;
-        }
-      }
-      tjDestroy(tj);
-    }
-  }
-  if (!src_px) {  // non-JPEG or turbo failed — fall back to stb_image
-    int ch = 0;
-    src_px = stbi_load_from_memory(d, (int)cover_data.size(), &src_w, &src_h, &ch, 4);
-    is_jpeg = false;  // track allocator: stbi_image_free vs free
-  }
-  if (!src_px) return nullptr;
-
-  // Stretch to exact cell dimensions — uniform grid, ratios are close enough
-  int dw = tw;
-  int dh = th;
-
-  SDL_Surface* src_surf = SDL_CreateRGBSurfaceFrom(
-      src_px, src_w, src_h, 32, src_w * 4,
-      0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
-  SDL_Surface* dst_surf = SDL_CreateRGBSurface(
-      0, dw, dh, 32, 0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
-
-  unsigned char* result = nullptr;
-  if (src_surf && dst_surf) {
-    SDL_BlitScaled(src_surf, NULL, dst_surf, NULL);
-    result = (unsigned char*)malloc((size_t)dw * dh * 4);
-    if (result) { memcpy(result, dst_surf->pixels, (size_t)dw * dh * 4); }
-    *out_iw = dw; *out_ih = dh;
-  }
-  SDL_FreeSurface(dst_surf);
-  SDL_FreeSurface(src_surf);
-  if (is_jpeg) free(src_px); else stbi_image_free(src_px);
-  return result;
+  return make_thumb_from_encoded(cover_data, tw, th, out_iw, out_ih);
 }
 
 // Extract cover from a PDF/EPUB as pre-scaled RGBA pixels.
@@ -729,13 +474,12 @@ static unsigned char* extract_pdf_cover_pixels(const char* path, int tw, int th,
       fz_throw(bg_ctx, FZ_ERROR_GENERIC, "no pages");
     page = fz_load_page(bg_ctx, doc, 0);
     fz_rect bounds = fz_bound_page(bg_ctx, page);
-    float scale = fminf((float)tw / bounds.x1, (float)th / bounds.y1);
+    float bw = bounds.x1 - bounds.x0, bh = bounds.y1 - bounds.y0;
+    float scale = fmaxf((float)tw / bw, (float)th / bh);  // fill, then crop
     pix = fz_new_pixmap_from_page_contents(
-        bg_ctx, page, fz_scale(scale, scale), fz_device_rgb(bg_ctx), 1);
-    size_t nbytes = (size_t)pix->h * pix->stride;
-    result = (unsigned char*)malloc(nbytes);
-    if (result) { memcpy(result, pix->samples, nbytes); }
-    *out_iw = pix->w; *out_ih = pix->h;
+        bg_ctx, page, fz_scale(scale, scale), fz_device_rgb(bg_ctx), 0);
+    result = crop_fill_rgba(pix->samples, pix->w, pix->h, (int)pix->stride, pix->n, tw, th);
+    if (result) { *out_iw = tw; *out_ih = th; }
   }
   fz_catch(bg_ctx) { result = nullptr; }
 
@@ -746,1047 +490,1545 @@ static unsigned char* extract_pdf_cover_pixels(const char* path, int tw, int th,
   return result;
 }
 
-// Create SDL_Texture from pre-scaled RGBA pixels on the main thread, then free pixels.
-static SDL_Texture* pixels_to_texture(unsigned char* pixels, int iw, int ih) {
-  if (!pixels) return nullptr;
-  SDL_Surface* surf = SDL_CreateRGBSurfaceFrom(
-      pixels, iw, ih, 32, iw * 4,
-      0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
-  SDL_Texture* tex = surf ? SDL_CreateTextureFromSurface(RENDERER, surf) : nullptr;
-  SDL_FreeSurface(surf);
-  free(pixels);
-  return tex;
+
+
+static unsigned char *extract_dir_cover_pixels(const char *dir, int tw, int th, int *iw, int *ih) {
+  DIR *d = opendir(dir);
+  if (!d) return nullptr;
+  string best;
+  while (struct dirent *e = readdir(d)) {
+    if (e->d_type == DT_DIR || e->d_name[0] == '.' || !is_image_file(e->d_name)) continue;
+    if (best.empty() || natural_less(e->d_name, best)) best = e->d_name;
+  }
+  closedir(d);
+  if (best.empty()) return nullptr;
+  FILE *f = fopen((string(dir) + "/" + best).c_str(), "rb");
+  if (!f) return nullptr;
+  vector<uint8_t> data;
+  uint8_t buf[65536];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) data.insert(data.end(), buf, buf + n);
+  fclose(f);
+  if (data.empty()) return nullptr;
+  return make_thumb_from_encoded(data, tw, th, iw, ih);
 }
 
-// ── Async cover loader ────────────────────────────────────────────────────────
-// One worker thread decodes cover pixels off the main thread.
-// Synchronization: two atomic flags (job_ready / result_ready) with ACQUIRE/RELEASE.
+// ── Texture LRU (owns all cover textures) ───────────────────────────────────
+
+struct LRUTextureCache {
+  static const int MAX_ENTRIES = 150;
+  list<string> order;  // front = most recently used
+  unordered_map<string, pair<SDL_Texture *, list<string>::iterator>> entries;
+
+  SDL_Texture *get(const string &key) {
+    auto it = entries.find(key);
+    if (it == entries.end()) return nullptr;
+    order.erase(it->second.second);
+    order.push_front(key);
+    it->second.second = order.begin();
+    return it->second.first;
+  }
+  void put(const string &key, SDL_Texture *tex) {
+    if (!tex) return;
+    auto it = entries.find(key);
+    if (it != entries.end()) {
+      SDL_DestroyTexture(it->second.first);
+      order.erase(it->second.second);
+      entries.erase(it);
+    }
+    while ((int)entries.size() >= MAX_ENTRIES) {
+      SDL_DestroyTexture(entries[order.back()].first);
+      entries.erase(order.back());
+      order.pop_back();
+    }
+    order.push_front(key);
+    entries[key] = {tex, order.begin()};
+  }
+  void clear() {
+    for (auto &kv : entries) SDL_DestroyTexture(kv.second.first);
+    entries.clear();
+    order.clear();
+  }
+};
+static LRUTextureCache g_cover_cache;
+
+// ── Background cover loader ─────────────────────────────────────────────────
+
+enum CoverKind { COVER_ARCHIVE = 0, COVER_MUPDF = 1, COVER_DIR = 2, COVER_NONE = 3 };
 
 struct CoverLoader {
-  // Job (written by main before RELEASE job_ready=1; read by worker after ACQUIRE)
-  char job_path[512];
-  int  job_tw, job_th, job_index;
-  bool job_is_pdf;
-  volatile int job_ready   = 0;
-
-  // Result (written by worker before RELEASE result_ready=1; read by main after ACQUIRE)
-  unsigned char* result_pixels = nullptr;
-  int            result_iw     = 0;
-  int            result_ih     = 0;
-  int            result_index  = -1;
-  volatile int   result_ready  = 0;
-
+  Mutex mtx;
+  Thread thread;
+  bool started = false;
   volatile int should_exit = 0;
-  volatile int stale       = 0;  // set by main to discard an in-flight result
-  Thread       thread;
+  bool busy = false;  // a job is queued or being processed
+  // job
+  bool has_job = false;
+  string job_path;
+  int job_tw = 0, job_th = 0, job_index = -1, job_kind = 0;
+  uint32_t job_gen = 0;
+  // result
+  bool has_result = false;
+  unsigned char *res_px = nullptr;
+  int res_w = 0, res_h = 0, res_index = -1;
+  uint32_t res_gen = 0;
+  string res_path;
 };
 
-static void cover_loader_worker(void* arg) {
-  CoverLoader* cl = static_cast<CoverLoader*>(arg);
-  while (!__atomic_load_n(&cl->should_exit, __ATOMIC_ACQUIRE)) {
-    if (!__atomic_load_n(&cl->job_ready, __ATOMIC_ACQUIRE)) {
-      svcSleepThread(2000000LL); continue;  // 2 ms poll
+// ── On-disk thumbnail cache ─────────────────────────────────────────────────
+// Every cover is rendered once at a fixed size and saved as a small JPEG, so
+// later launches (and other grid sizes) only need a fast decode.
+
+static const int THUMB_W = 400, THUMB_H = 580;
+
+static string thumb_path(const string &path) {
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) return "";
+  uint64_t h = 14695981039346656037ULL;
+  for (unsigned char c : path) { h ^= c; h *= 1099511628211ULL; }
+  h ^= (uint64_t)st.st_size; h *= 1099511628211ULL;
+  h ^= (uint64_t)st.st_mtime; h *= 1099511628211ULL;
+  h ^= (uint64_t)(THUMB_W * 10000 + THUMB_H); h *= 1099511628211ULL;
+  char buf[512];
+  snprintf(buf, sizeof(buf), "%s/%016llx.thm", PAGECACHE_DIR, (unsigned long long)h);
+  return buf;
+}
+
+static unsigned char *load_thumb(const string &tp, int *w, int *h) {
+  FILE *f = fopen(tp.c_str(), "rb");
+  if (!f) return nullptr;
+  vector<uint8_t> data;
+  uint8_t buf[65536];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) data.insert(data.end(), buf, buf + n);
+  fclose(f);
+  if (data.size() < 4) return nullptr;
+  tjhandle tj = tjInitDecompress();
+  if (!tj) return nullptr;
+  int sub = 0, cs = 0;
+  unsigned char *px = nullptr;
+  if (tjDecompressHeader3(tj, data.data(), (unsigned long)data.size(), w, h, &sub, &cs) == 0 &&
+      *w > 0 && *h > 0) {
+    px = (unsigned char *)malloc((size_t)*w * *h * 4);
+    if (px && tjDecompress2(tj, data.data(), (unsigned long)data.size(), px, *w, 0, *h, TJPF_RGBA,
+                            TJFLAG_FASTDCT) != 0) {
+      free(px);
+      px = nullptr;
     }
-    string path   = cl->job_path;
-    int    tw     = cl->job_tw, th = cl->job_th;
-    int    idx    = cl->job_index;
-    bool   is_pdf = cl->job_is_pdf;
-    __atomic_store_n(&cl->job_ready, 0, __ATOMIC_RELEASE);
+  }
+  tjDestroy(tj);
+  return px;
+}
 
+static void save_thumb(const string &tp, const unsigned char *px, int w, int h) {
+  tjhandle tj = tjInitCompress();
+  if (!tj) return;
+  unsigned char *jpg = nullptr;
+  unsigned long size = 0;
+  if (tjCompress2(tj, px, w, 0, h, TJPF_RGBA, &jpg, &size, TJSAMP_420, 85, TJFLAG_FASTDCT) == 0 &&
+      jpg && size) {
+    mkdir(PAGECACHE_DIR, 0755);
+    string tmp = tp + ".tmp";
+    FILE *f = fopen(tmp.c_str(), "wb");
+    if (f) {
+      bool ok = fwrite(jpg, 1, size, f) == size;
+      fclose(f);
+      if (ok) rename(tmp.c_str(), tp.c_str());
+      else remove(tmp.c_str());
+    }
+  }
+  if (jpg) tjFree(jpg);
+  tjDestroy(tj);
+}
+
+static void cover_worker(void *arg) {
+  CoverLoader *cl = static_cast<CoverLoader *>(arg);
+  while (!__atomic_load_n(&cl->should_exit, __ATOMIC_ACQUIRE)) {
+    mutexLock(&cl->mtx);
+    if (!cl->has_job) {
+      mutexUnlock(&cl->mtx);
+      svcSleepThread(3000000LL);
+      continue;
+    }
+    string path = cl->job_path;
+    int tw = cl->job_tw, th = cl->job_th, idx = cl->job_index, kind = cl->job_kind;
+    uint32_t gen = cl->job_gen;
+    cl->has_job = false;
+    mutexUnlock(&cl->mtx);
+
+    (void)tw;
+    (void)th;
     int iw = 0, ih = 0;
-    unsigned char* pixels = is_pdf
-        ? extract_pdf_cover_pixels(path.c_str(), tw, th, &iw, &ih)
-        : extract_cbz_cover_pixels(path.c_str(), tw, th, &iw, &ih);
+    string tp = thumb_path(path);
+    unsigned char *px = tp.empty() ? nullptr : load_thumb(tp, &iw, &ih);
+    if (!px) {
+      if (kind == COVER_ARCHIVE) px = extract_cbz_cover_pixels(path.c_str(), THUMB_W, THUMB_H, &iw, &ih);
+      else if (kind == COVER_MUPDF) px = extract_pdf_cover_pixels(path.c_str(), THUMB_W, THUMB_H, &iw, &ih);
+      else if (kind == COVER_DIR) px = extract_dir_cover_pixels(path.c_str(), THUMB_W, THUMB_H, &iw, &ih);
+      if (px && !tp.empty()) save_thumb(tp, px, iw, ih);
+    }
 
-    cl->result_pixels = pixels;
-    cl->result_iw     = iw;
-    cl->result_ih     = ih;
-    cl->result_index  = idx;
-    __atomic_store_n(&cl->result_ready, 1, __ATOMIC_RELEASE);
+    for (;;) {
+      mutexLock(&cl->mtx);
+      if (!cl->has_result) break;
+      mutexUnlock(&cl->mtx);
+      if (__atomic_load_n(&cl->should_exit, __ATOMIC_ACQUIRE)) {
+        free(px);
+        return;
+      }
+      svcSleepThread(1000000LL);
+    }
+    cl->has_result = true;
+    cl->res_px = px;
+    cl->res_w = iw;
+    cl->res_h = ih;
+    cl->res_index = idx;
+    cl->res_gen = gen;
+    cl->res_path = path;
+    cl->busy = false;
+    mutexUnlock(&cl->mtx);
   }
 }
 
-// ── Main chooser ─────────────────────────────────────────────────────────────
+// ── Library model ───────────────────────────────────────────────────────────
 
-void Menu_StartChoosing() {
-  SDL_Texture* folder_textures[] = {
-      adwaita_folder,    black_folder,       blue_grey_folder, blue_folder,
-      breeze_folder,     brown_folder,       carmine_folder,   cyan_folder,
-      dark_cyan_folder,  deep_orange_folder, green_folder,     grey_folder,
-      indigo_folder,     magenta_folder,     nordic_folder,    orange_folder,
-      pale_brown_folder, pale_orange_folder, pink_folder,      red_folder,
-      teal_folder,       violet_folder,      white_folder,     yaru_folder,
-      yellow_folder};
-  SDL_Texture* book_textures[] = {
-      adwaita_book,    black_book,       blue_grey_book, blue_book,
-      breeze_book,     brown_book,       carmine_book,   cyan_book,
-      dark_cyan_book,  deep_orange_book, green_book,     grey_book,
-      indigo_book,     magenta_book,     nordic_book,    orange_book,
-      pale_brown_book, pale_orange_book, pink_book,      red_book,
-      teal_book,       violet_book,      white_book,     yaru_book,
-      yellow_book};
+enum EntryKind { E_CONTINUE, E_RECENT, E_IMAGES, E_FOLDER, E_BOOK };
 
-  unsigned int chosenFolderColor = 0;
-  unsigned int chosenBookColor   = 0;
-  int scroll_option = 1;
-  int zoom_option   = 1;
+struct Entry {
+  string path;
+  string name;
+  EntryKind kind;
+  CoverKind cover;
+  string label;  // E_CONTINUE caption
+  int last = 0, total = 0;
+  uint8_t cover_state = 0;  // 0 none, 1 requested, 2 loaded, 3 failed
+};
 
-  string colors[] = {
-      "Adwaita", "Black",      "Blue_Grey",   "Blue",      "Breeze",
-      "Brown",   "Carmine",    "Cyan",        "Dark_Cyan", "Deep_Orange",
-      "Green",   "Grey",       "Indigo",      "Magenta",   "Nordic",
-      "Orange",  "Pale_Brown", "Pale_Orange", "Pink",      "Red",
-      "Teal",    "Violet",     "White",       "Yaru",      "Yellow"};
+static CoverKind cover_kind_for(const string &path) {
+  struct stat st;
+  if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return COVER_DIR;
+  if (Library_IsComicArchive(path)) return COVER_ARCHIVE;
+  if (Library_Ext(path) == ".txt") return COVER_NONE;
+  return COVER_MUPDF;
+}
 
-  load_config(&chosenFolderColor, &chosenBookColor, &scroll_option,
-              &zoom_option, &configDarkMode);
-
-  SDL_Texture* folder_image = folder_textures[chosenFolderColor];
-  SDL_Texture* book_image   = book_textures[chosenBookColor];
-
-  float zoom_amount = 0.3f * zoom_option;
-  int   scroll_speed = 3 * scroll_option;
-
-  int chosen_index = 0;
-
-  list<string> allowedExtentions = {".pdf", ".epub", ".cbz", ".cbr",
-                                    ".cbt", ".cb7",  ".xps", "directory"};
-  list<string> warnedExtentions  = {".epub", ".xps"};
-
-  bool drawOption  = false;
-  int  option_index   = 0;
-  int  amountOfOptions = 6;
-
-  string path = "/switch/WookReader";
-
-  int windowX, windowY;
-  SDL_GetWindowSize(WINDOW, &windowX, &windowY);
-  int warningWidth  = 700;
-  int warningHeight = 300;
-
-  // ── Dynamic grid dimensions (ZL = zoom out / ZR = zoom in) ──────────────────
-  int cols    = 5;
-  int cell_w  = 1280 / cols;
-  int thumb_w = cell_w - 2;  // 1px gap per side — covers almost touching
-  int thumb_h = (int)(thumb_w * (3000.0f / 1988.0f));  // comic page portrait ratio
-  int cell_h  = thumb_h;     // title overlaid on cover, no separate row below
-
-  // Grid state
-  int numFolders = 0;
-  vector<SDL_Texture*> cover_textures;
-  vector<pair<int,int>> entry_progress;  // parallel to cover_textures: (last_page, total_pages)
-  int scroll_y = 0;
-  int cover_load_index = 0;  // next cover index to submit to background loader
-
-  vector<fs::path> sorted_entries;
-  int amountOfFiles = 0;
-  bool isWarningOnScreen = false;
-  bool inRecentFolder = false;
-
-  // Notes overlay state
-  bool drawNotesChooser = false;
-  string notesChooserPath;   // absolute path of the comic whose note is shown
-  string notesChooserText;   // cached note content
-
-  // Cache for truncated display filenames: key = "fname|pixel_limit" → truncated string.
-  unordered_map<string, string> trunc_cache;
-
-  // Background cover loaders — two workers on cores 1 and 2
-  static const int N_WORKERS = 2;
-  CoverLoader cl[N_WORKERS];
-  int cl_in_flight[N_WORKERS] = {-1, -1};
-
-  // ── Helpers ────────────────────────────────────────────────────────────────
-  // Keep the selected item visible in the viewport.
-  auto update_scroll = [&]() {
-    int top, bot;
-    if (chosen_index < numFolders) {
-      top = chosen_index * FOLDER_H;
-      bot = top + FOLDER_H;
-    } else {
-      int bi  = chosen_index - numFolders;
-      int row = bi / cols;
-      top = numFolders * FOLDER_H + row * cell_h;
-      bot = top + cell_h;
+// Lists a directory: folders first, then books, natural order. Reports
+// whether the folder itself contains loose images.
+static void scan_dir(const string &dir, vector<Entry> &folders, vector<Entry> &books,
+                     bool *has_images) {
+  *has_images = false;
+  DIR *d = opendir(dir.c_str());
+  if (!d) return;
+  while (struct dirent *e = readdir(d)) {
+    if (e->d_name[0] == '.') continue;  // hidden + . / ..
+    string name = e->d_name;
+    string full = dir + "/" + name;
+    bool isdir = e->d_type == DT_DIR;
+    if (e->d_type == DT_UNKNOWN) {
+      struct stat st;
+      isdir = stat(full.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
     }
-    int usable = windowY - BOTTOM_H;
-    if (top < scroll_y)          scroll_y = top;
-    if (bot > scroll_y + usable) scroll_y = bot - usable;
-    if (scroll_y < 0) scroll_y = 0;
-  };
-
-  // Recompute derived grid dimensions from cols.
-  auto recalc_grid = [&]() {
-    cell_w  = 1280 / cols;
-    thumb_w = cell_w - 2;
-    thumb_h = (int)(thumb_w * (3000.0f / 1988.0f));  // comic page portrait ratio
-    cell_h  = thumb_h;
-  };
-
-  // Load saved progress (last page + total pages) for all book entries.
-  auto load_entry_progress = [&]() {
-    if (!config) {
-      config = (config_t*)malloc(sizeof(config_t));
-      config_init(config);
-      config_read_file(config, configFile);
+    if (isdir) {
+      folders.push_back({full, name, E_FOLDER, COVER_NONE});
+    } else if (Library_IsSupportedBook(name)) {
+      books.push_back({full, Library_DisplayName(name), E_BOOK, cover_kind_for(full)});
+    } else if (Library_IsImageFile(name)) {
+      *has_images = true;
     }
-    int numBooks = (int)sorted_entries.size() - numFolders;
-    entry_progress.assign(numBooks, {0, 0});
-    for (int i = 0; i < numBooks; i++) {
-      string key = chooser_sanitize(sorted_entries[numFolders + i].string());
-      int last = 0, total = 0;
-      config_setting_t* s =
-          config_setting_get_member(config_root_setting(config), key.c_str());
-      if (s) last = config_setting_get_int(s);
-      string tkey = key + "_T";
-      config_setting_t* st =
-          config_setting_get_member(config_root_setting(config), tkey.c_str());
-      if (st) total = config_setting_get_int(st);
-      entry_progress[i] = {last, total};
-    }
-  };
+  }
+  closedir(d);
+  auto by_name = [](const Entry &a, const Entry &b) { return natural_less(a.name, b.name); };
+  sort(folders.begin(), folders.end(), by_name);
+  sort(books.begin(), books.end(), by_name);
+}
 
-  // Pick the largest label font that suits the current cell width.
-  auto pick_label_font = [&]() -> TTF_Font* {
-    if (cell_w >= 300) return ROBOTO_25;
-    if (cell_w >= 190) return ROBOTO_20;
-    return ROBOTO_15;
-  };
+// ── Browser ─────────────────────────────────────────────────────────────────
 
-  // Load (or reload) a directory: refresh sorted entries and cover thumbnails.
-  auto enter_directory = [&](const string& dir) {
-    // Cancel any queued/in-flight jobs instantly — no waiting.
-    // Workers that are mid-decode will finish, but their results are marked stale
-    // and discarded by the result-consumption loop below.
-    for (int w = 0; w < N_WORKERS; w++) {
-      __atomic_store_n(&cl[w].job_ready, 0, __ATOMIC_RELEASE);  // cancel queued job
-      if (cl_in_flight[w] >= 0) {
-        __atomic_store_n(&cl[w].stale, 1, __ATOMIC_RELEASE);    // discard when ready
-        cl_in_flight[w] = -1;
-      }
-    }
+struct SettingDef {
+  const char *label;
+  const char *desc;
+  function<string()> value;   // empty string = action row
+  function<void(int)> change;
+  bool info = false;  // read-only row
+};
 
-    cover_textures.clear();  // cache owns textures, do NOT destroy them here
-    trunc_cache.clear();
-    scroll_y     = 0;
-    chosen_index = 0;
+struct SettingCat {
+  const char *name;
+  vector<SettingDef> items;
+};
 
-    sorted_entries = get_sorted_entries(dir, allowedExtentions, &numFolders);
+struct Chip {
+  SDL_Rect r;
+  u64 button;
+};
 
-    // Inject virtual "Recently Opened" folder at root when history exists
-    if (dir == "/switch/WookReader" && !g_recent.empty()) {
-      sorted_entries.insert(sorted_entries.begin(), fs::path(RECENT_SENTINEL));
-      numFolders++;
-    }
+struct HintDef {
+  const char *btn;
+  const char *label;
+  u64 button;
+};
 
-    amountOfFiles  = (int)sorted_entries.size();
+class Chooser {
+ public:
+  Chooser();
+  ~Chooser();
+  void run();
 
-    int numBooks = amountOfFiles - numFolders;
-    cover_textures.resize(numBooks, nullptr);
-    cover_load_index = 0;
-    load_entry_progress();
-  };
+ private:
+  enum Overlay { OV_NONE, OV_TYPE, OV_NOTES, OV_CONFIRM, OV_SENSOR, OV_APPLET };
 
-  // Populate grid from g_recent (no filesystem scan).
-  auto enter_recent = [&]() {
-    for (int w = 0; w < N_WORKERS; w++) {
-      __atomic_store_n(&cl[w].job_ready, 0, __ATOMIC_RELEASE);
-      if (cl_in_flight[w] >= 0) {
-        __atomic_store_n(&cl[w].stale, 1, __ATOMIC_RELEASE);
-        cl_in_flight[w] = -1;
-      }
-    }
-    inRecentFolder = true;
-    cover_textures.clear();
-    trunc_cache.clear();
-    scroll_y = 0; chosen_index = 0;
-    numFolders = 0;
-    sorted_entries.clear();
-    for (const auto& p : g_recent) sorted_entries.push_back(fs::path(p));
-    amountOfFiles = (int)sorted_entries.size();
-    cover_textures.resize(amountOfFiles, nullptr);
-    cover_load_index = 0;
-    load_entry_progress();
-  };
+  // model
+  void enter_dir(const string &dir);
+  void enter_recent();
+  void reload();
+  void refresh_progress();
+  bool go_back();  // false = leave the app
+  void open_selected();
+  void open_entry(const Entry &e);
 
-  load_recent();
-  enter_directory(path);
+  // layout
+  void relayout();
+  void ensure_visible();
+  void move_sel(int dirs);
+  int hit_test(float x, float y) const;
+  int view_top() const { return HEADER_H; }
+  int view_h() const { return H - HEADER_H - FOOTER_H; }
+  int grid_cols() const;
 
-  padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+  // covers
+  void cancel_covers();
+  void pump_covers();
+
+  // dialogs
+  void open_type_dialog();
+  void on_type_choice(int i);
+  void edit_notes();
+  void build_settings();
+
+  // input
+  void library_input(u64 kDown, int dirs);
+  void library_touch();
+  void settings_input(u64 kDown, int dirs);
+  void settings_touch();
+  void overlay_input(u64 kDown, int dirs);
+
+  // drawing
+  void draw();
+  void draw_header(const string &title, const string &sub, bool back);
+  void draw_footer(const vector<HintDef> &hints, const string &left);
+  void draw_library();
+  void draw_folder_card(const Entry &e, SDL_Rect r, bool selected);
+  void draw_continue_card(Entry &e, SDL_Rect r, bool selected);
+  void draw_book_cell(Entry &e, SDL_Rect r, bool selected);
+  void draw_settings();
+  void draw_overlay();
+
+  static const int HEADER_H = 88;
+  static const int FOOTER_H = 64;
+  static const int PAD = 24;
+  static const int GAP = 18;
+
+  int W = 1280, H = 720, rot = -1;
+  string root = BOOKS_DIR;
+  string path = BOOKS_DIR;
+  bool in_recent = false;
+  vector<Entry> entries;
+  int num_cards = 0;  // folders + special cards (come first)
+  vector<SDL_Rect> rects;  // content coordinates
+  vector<int> section_y;   // y of section titles (content coordinates)
+  vector<string> section_name;
+  int content_h = 0, cover_w = 0, cover_h = 0;
+  int sel = 0;
+  float scroll = 0, fling = 0;
+  bool layout_dirty = true;
+
+  bool settings_open = false;
+  vector<SettingCat> cats;
+  int cat = 0, item = 0, focus = 0;  // focus 0 sidebar, 1 items
+  vector<SDL_Rect> cat_rects, item_rects;
+
+  Overlay overlay = OV_NONE;
+  ListMenu menu;
+  string notes_path, notes_text;
+  function<void()> confirm_action;
+
+  vector<Chip> chips;
+  SDL_Rect back_rect = {0, 0, 0, 0};
+  TouchTracker touch;
+  KeyRepeat keys;
   PadState pad;
-  padInitializeDefault(&pad);
-  hidInitializeTouchScreen();
-
-  // Start background cover loaders on cores 1 and 2
-  int cover_cores[N_WORKERS] = {1, 2};
-  for (int w = 0; w < N_WORKERS; w++) {
-    threadCreate(&cl[w].thread, cover_loader_worker, &cl[w],
-                 nullptr, 512 * 1024, 0x2C, cover_cores[w]);
-    threadStart(&cl[w].thread);
+  bool quit = false;
+  bool settings_dirty = false;
+  // Cache size shown in Settings → Storage (re-scanned only when needed).
+  bool cache_dirty = true;
+  unsigned long long cache_bytes = 0;
+  int cache_files = 0;
+  string cache_usage_text() {
+    if (cache_dirty) {
+      Library_CacheUsage(&cache_bytes, &cache_files);
+      cache_dirty = false;
+    }
+    char buf[64];
+    double mb = cache_bytes / (1024.0 * 1024.0);
+    if (mb >= 1024.0)
+      snprintf(buf, sizeof(buf), "%.2f GB", mb / 1024.0);
+    else if (mb >= 10.0)
+      snprintf(buf, sizeof(buf), "%.0f MB", mb);
+    else
+      snprintf(buf, sizeof(buf), "%.1f MB", mb);
+    return string(buf) + "  \xC2\xB7  " + std::to_string(cache_files) + (cache_files == 1 ? " file" : " files");
   }
 
-  float touch_prev_y0    = 0.0f;
-  int   touch_prev_count = 0;
-  float touch_start_x    = 0.0f, touch_start_y = 0.0f;
-  bool  touch_dragging   = false;
+  static const int N_WORKERS = 2;
+  CoverLoader cl[N_WORKERS];
+  uint32_t gen = 1;
+};
 
-  // ── Main loop ──────────────────────────────────────────────────────────────
-  while (appletMainLoop()) {
+Chooser::Chooser() {
+  MuPDF_Context();  // PDF/EPUB thumbnails need it
+  int cores[N_WORKERS] = {1, 2};
+  for (int w = 0; w < N_WORKERS; w++) {
+    mutexInit(&cl[w].mtx);
+    if (R_SUCCEEDED(threadCreate(&cl[w].thread, cover_worker, &cl[w], nullptr, 512 * 1024, 0x2C,
+                                 cores[w]))) {
+      if (R_SUCCEEDED(threadStart(&cl[w].thread)))
+        cl[w].started = true;
+      else
+        threadClose(&cl[w].thread);
+    }
+  }
+  build_settings();
+  if (App_IsAppletMode()) {
+    menu = ListMenu();
+    menu.title = "Applet mode";
+    menu.subtitle = "BookReader has limited memory, so pages load slower";
+    menu.min_w = 680;
+    menu.items = {{"Got it", "", "For full speed, hold R while launching any game"}};
+    overlay = OV_APPLET;
+  }
+  padInitializeDefault(&pad);
+  padUpdate(&pad);
+  enter_dir(root);
+}
+
+Chooser::~Chooser() {
+  for (int w = 0; w < N_WORKERS; w++) __atomic_store_n(&cl[w].should_exit, 1, __ATOMIC_RELEASE);
+  for (int w = 0; w < N_WORKERS; w++) {
+    if (cl[w].started) {
+      threadWaitForExit(&cl[w].thread);
+      threadClose(&cl[w].thread);
+    }
+    free(cl[w].res_px);
+    cl[w].res_px = nullptr;
+  }
+  g_cover_cache.clear();
+  if (settings_dirty) Settings_Save();
+}
+
+// ── model ────────────────────────────────────────────────────────────────────
+
+void Chooser::cancel_covers() {
+  gen++;
+  for (int w = 0; w < N_WORKERS; w++) {
+    mutexLock(&cl[w].mtx);
+    if (cl[w].has_job) {
+      cl[w].has_job = false;
+      cl[w].busy = false;
+    }
+    mutexUnlock(&cl[w].mtx);
+  }
+}
+
+void Chooser::enter_dir(const string &dir) {
+  cancel_covers();
+  in_recent = false;
+  path = dir;
+  vector<Entry> folders, books;
+  bool has_images = false;
+  scan_dir(dir, folders, books, &has_images);
+  entries.clear();
+  if (dir == root && !Recent_Get().empty()) {
+    // "Continue reading": the last book, or the next chapter if it was finished.
+    string last = Recent_Get()[0];
+    int lp = Progress_GetPage(last), lt = Progress_GetTotal(last);
+    string target = last, label = "CONTINUE READING";
+    if (lt > 0 && lp + 1 >= lt) {
+      string nx = Library_Sibling(last, +1);
+      if (!nx.empty()) {
+        target = nx;
+        label = "UP NEXT";
+      }
+    }
+    struct stat st;
+    bool isdir = stat(target.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    Entry c{target, isdir ? target.substr(target.find_last_of('/') + 1) : Library_DisplayName(target),
+            E_CONTINUE, cover_kind_for(target)};
+    c.label = label;
+    entries.push_back(c);
+  }
+  if (dir == root && !Recent_Get().empty())
+    entries.push_back({"", "Recently opened", E_RECENT, COVER_NONE});
+  if (has_images)
+    entries.push_back({dir, "Read the images in this folder", E_IMAGES, COVER_NONE});
+  for (auto &f : folders) entries.push_back(f);
+  num_cards = (int)entries.size();
+  for (auto &b : books) entries.push_back(b);
+  refresh_progress();
+  sel = 0;
+  scroll = fling = 0;
+  layout_dirty = true;
+}
+
+void Chooser::enter_recent() {
+  cancel_covers();
+  in_recent = true;
+  entries.clear();
+  for (const auto &p : Recent_Get()) {
+    struct stat st;
+    bool dir = stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    string name = dir ? p.substr(p.find_last_of('/') + 1) : Library_DisplayName(p);
+    entries.push_back({p, name, E_BOOK, cover_kind_for(p)});
+  }
+  num_cards = 0;
+  refresh_progress();
+  sel = 0;
+  scroll = fling = 0;
+  layout_dirty = true;
+}
+
+void Chooser::reload() {
+  int keep = sel;
+  float keep_scroll = scroll;
+  if (in_recent)
+    enter_recent();
+  else
+    enter_dir(path);
+  if (!in_recent) {
+    sel = std::min(keep, (int)entries.size() - 1);
+    if (sel < 0) sel = 0;
+    scroll = keep_scroll;
+  }
+}
+
+void Chooser::refresh_progress() {
+  for (auto &e : entries) {
+    if (e.kind != E_BOOK && e.kind != E_CONTINUE) continue;
+    e.last = Progress_GetPage(e.path);
+    e.total = Progress_GetTotal(e.path);
+  }
+}
+
+bool Chooser::go_back() {
+  if (in_recent) {
+    enter_dir(path);
+    return true;
+  }
+  if (path == root) return false;
+  string parent = path.substr(0, path.find_last_of('/'));
+  if (parent.size() < root.size()) parent = root;
+  string from = path;
+  enter_dir(parent);
+  for (int i = 0; i < (int)entries.size(); i++)
+    if (entries[i].path == from) {
+      sel = i;
+      layout_dirty = true;
+    }
+  return true;
+}
+
+void Chooser::open_entry(const Entry &e) {
+  cancel_covers();  // don't decode thumbnails in the background while reading
+  for (auto &en : entries)
+    if (en.cover_state == 1) en.cover_state = 0;
+  Recent_Push(e.path);
+  Menu_OpenBook(e.path.c_str());
+  padUpdate(&pad);  // swallow the button that closed the reader
+  touch = TouchTracker();
+  refresh_progress();
+  if (in_recent)
+    enter_recent();
+  else if (path == root)
+    enter_dir(root);  // refresh the Continue reading card
+  layout_dirty = true;
+}
+
+void Chooser::open_selected() {
+  if (sel < 0 || sel >= (int)entries.size()) return;
+  Entry e = entries[sel];
+  switch (e.kind) {
+    case E_RECENT: enter_recent(); break;
+    case E_FOLDER: enter_dir(e.path); break;
+    case E_CONTINUE:
+    case E_IMAGES:
+    case E_BOOK: open_entry(e); break;
+  }
+}
+
+// ── layout ───────────────────────────────────────────────────────────────────
+
+int Chooser::grid_cols() const {
+  int c = g_settings.grid_cols;
+  if (W < 1000) c = std::max(2, (int)lroundf(c * 0.6f));
+  return c;
+}
+
+void Chooser::relayout() {
+  layout_dirty = false;
+  rects.assign(entries.size(), SDL_Rect{0, 0, 0, 0});
+  section_y.clear();
+  section_name.clear();
+  int y = 12;
+  int inner = W - 2 * PAD;
+  bool both = num_cards > 0 && num_cards < (int)entries.size();
+
+  int first_card = 0;
+  if (!entries.empty() && entries[0].kind == E_CONTINUE) {
+    int ch = W >= 1000 ? 176 : 200;
+    rects[0] = {PAD, y, inner, ch};
+    y += ch + 22;
+    first_card = 1;
+  }
+  int ncards = num_cards - first_card;
+  if (ncards > 0) {
+    int fcols = W >= 1000 ? 3 : 2;
+    int fw = (inner - (fcols - 1) * GAP) / fcols, fh = 68;
+    if (both) {
+      section_y.push_back(y);
+      section_name.push_back("Folders");
+      y += 34;
+    }
+    for (int i = 0; i < ncards; i++) {
+      int r = i / fcols, c = i % fcols;
+      rects[first_card + i] = {PAD + c * (fw + GAP), y + r * (fh + 14), fw, fh};
+    }
+    y += ((ncards + fcols - 1) / fcols) * (fh + 14) + 10;
+  }
+
+  int nb = (int)entries.size() - num_cards;
+  if (nb > 0) {
+    if (both) {
+      section_y.push_back(y);
+      section_name.push_back(in_recent ? "" : "Books");
+      y += 34;
+    }
+    int cols = grid_cols();
+    cover_w = (inner - (cols - 1) * GAP) / cols;
+    cover_h = (int)(cover_w * 1.45f);
+    int cell_h = cover_h + 64;
+    for (int b = 0; b < nb; b++) {
+      int r = b / cols, c = b % cols;
+      rects[num_cards + b] = {PAD + c * (cover_w + GAP), y + r * (cell_h + 10), cover_w, cell_h};
+    }
+    y += ((nb + cols - 1) / cols) * (cell_h + 10);
+  }
+  content_h = y + 12;
+  // Previously loaded thumbnails may be the wrong size now.
+  for (auto &e : entries)
+    if (e.cover_state == 3) e.cover_state = 0;
+  ensure_visible();
+}
+
+void Chooser::ensure_visible() {
+  if (sel < 0 || sel >= (int)rects.size()) return;
+  const SDL_Rect &r = rects[sel];
+  float top = (float)r.y - 12, bot = (float)(r.y + r.h + 12);
+  if (top < scroll) scroll = top;
+  if (bot > scroll + view_h()) scroll = bot - view_h();
+  float max_s = std::max(0, content_h - view_h());
+  scroll = std::min(std::max(scroll, 0.0f), max_s);
+}
+
+void Chooser::move_sel(int dirs) {
+  if (entries.empty() || sel >= (int)rects.size()) return;
+  const SDL_Rect &c = rects[sel];
+  float cx = c.x + c.w / 2.0f, cy = c.y + c.h / 2.0f;
+  int best = -1;
+  float best_score = 1e9f;
+  for (int i = 0; i < (int)rects.size(); i++) {
+    if (i == sel) continue;
+    const SDL_Rect &r = rects[i];
+    float dx = r.x + r.w / 2.0f - cx, dy = r.y + r.h / 2.0f - cy;
+    float primary, secondary;
+    if (dirs & DIR_RIGHT) { primary = dx; secondary = dy; if (fabsf(dy) > c.h / 2.0f) continue; }
+    else if (dirs & DIR_LEFT) { primary = -dx; secondary = dy; if (fabsf(dy) > c.h / 2.0f) continue; }
+    else if (dirs & DIR_DOWN) { primary = dy; secondary = dx; }
+    else if (dirs & DIR_UP) { primary = -dy; secondary = dx; }
+    else return;
+    if (primary <= 2) continue;
+    float score = primary + 2.5f * fabsf(secondary);
+    if (score < best_score) {
+      best_score = score;
+      best = i;
+    }
+  }
+  if (best >= 0) {
+    sel = best;
+    fling = 0;
+    ensure_visible();
+  }
+}
+
+int Chooser::hit_test(float x, float y) const {
+  if (y < view_top() || y > view_top() + view_h()) return -1;
+  float cy = y - view_top() + scroll;
+  for (int i = 0; i < (int)rects.size(); i++) {
+    const SDL_Rect &r = rects[i];
+    if (x >= r.x && x < r.x + r.w && cy >= r.y && cy < r.y + r.h) return i;
+  }
+  return -1;
+}
+
+// ── covers ───────────────────────────────────────────────────────────────────
+
+void Chooser::pump_covers() {
+  // Collect finished thumbnails.
+  for (int w = 0; w < N_WORKERS; w++) {
+    mutexLock(&cl[w].mtx);
+    if (!cl[w].has_result) {
+      mutexUnlock(&cl[w].mtx);
+      continue;
+    }
+    unsigned char *px = cl[w].res_px;
+    int iw = cl[w].res_w, ih = cl[w].res_h, idx = cl[w].res_index;
+    uint32_t rg = cl[w].res_gen;
+    string rpath = cl[w].res_path;
+    cl[w].res_px = nullptr;
+    cl[w].has_result = false;
+    mutexUnlock(&cl[w].mtx);
+
+    bool current = rg == gen && idx >= 0 && idx < (int)entries.size() && entries[idx].path == rpath;
+    if (!px) {
+      if (current) entries[idx].cover_state = 3;
+      continue;
+    }
+    SDL_Surface *s = SDL_CreateRGBSurfaceFrom(px, iw, ih, 32, iw * 4, 0x000000FF, 0x0000FF00,
+                                              0x00FF0000, 0xFF000000);
+    SDL_Texture *t = s ? SDL_CreateTextureFromSurface(RENDERER, s) : nullptr;
+    if (s) SDL_FreeSurface(s);
+    free(px);
+    if (t) g_cover_cache.put(rpath, t);  // useful even if the user moved on
+    if (current) entries[idx].cover_state = t ? 2 : 3;
+  }
+
+  // Only covers on screen (plus a little margin) are ever loaded.
+  float win_top = scroll - view_h() * 0.5f, win_bot = scroll + view_h() * 1.5f;
+  auto visible = [&](int i) {
+    return i < (int)rects.size() && rects[i].y + rects[i].h >= win_top && rects[i].y <= win_bot;
+  };
+  auto needs = [&](int i) {
+    Entry &e = entries[i];
+    if ((e.kind != E_BOOK && e.kind != E_CONTINUE) || e.cover == COVER_NONE || e.cover_state == 1 ||
+        e.cover_state == 3)
+      return false;
+    if (g_cover_cache.get(e.path)) {
+      e.cover_state = 2;
+      return false;
+    }
+    return visible(i);
+  };
+  for (int w = 0; w < N_WORKERS; w++) {
+    if (!cl[w].started) continue;
+    mutexLock(&cl[w].mtx);
+    bool busy = cl[w].busy;
+    mutexUnlock(&cl[w].mtx);
+    if (busy) continue;
+    int pick = -1;
+    for (int i = 0; i < (int)entries.size() && pick < 0; i++)
+      if (needs(i)) pick = i;
+    if (pick < 0) break;
+    entries[pick].cover_state = 1;
+    mutexLock(&cl[w].mtx);
+    cl[w].busy = true;
+    cl[w].has_job = true;
+    cl[w].job_path = entries[pick].path;
+    cl[w].job_tw = cover_w;
+    cl[w].job_th = cover_h;
+    cl[w].job_index = pick;
+    cl[w].job_kind = entries[pick].cover;
+    cl[w].job_gen = gen;
+    mutexUnlock(&cl[w].mtx);
+  }
+}
+
+// ── dialogs ──────────────────────────────────────────────────────────────────
+
+static const char *type_name(ContentType t, bool folder) {
+  if (t == CONTENT_MANGA) return "Manga";
+  if (t == CONTENT_BOOK) return folder ? "Books" : "Book";
+  return "Not set";
+}
+
+void Chooser::open_type_dialog() {
+  if (sel < 0 || sel >= (int)entries.size()) return;
+  const Entry &e = entries[sel];
+  if (e.kind == E_RECENT || e.kind == E_CONTINUE) return;
+  bool folder = e.kind == E_FOLDER || e.kind == E_IMAGES;
+  ContentType cur = Library_GetMark(e.path);
+  ContentType inh = Library_InheritedMark(e.path);
+  menu = ListMenu();
+  menu.min_w = 640;
+  if (folder) {
+    menu.title = "Mark folder";
+    menu.subtitle = e.kind == E_IMAGES ? path.substr(path.find_last_of('/') + 1) : e.name;
+    menu.items = {
+        {"Manga / comics", "", "Every file inside keeps its colours in dark mode"},
+        {"Books", "", "Every file inside is inverted in dark mode"},
+        {"Not set", "", inh != CONTENT_UNKNOWN ? string("Uses the parent folder: ") + type_name(inh, true)
+                                               : "You'll be asked when opening a file"},
+    };
+  } else {
+    menu.title = "Display as";
+    menu.subtitle = e.name;
+    menu.items = {
+        {"Manga / comic", "", "Keeps colours, black around the page in dark mode"},
+        {"Book", "", "White pages turn black, text turns white in dark mode"},
+        {"Use folder setting", "", inh != CONTENT_UNKNOWN ? string("Folder: ") + type_name(inh, true)
+                                                          : "No folder setting: you'll be asked"},
+    };
+  }
+  menu.sel = cur == CONTENT_MANGA ? 0 : cur == CONTENT_BOOK ? 1 : 2;
+  overlay = OV_TYPE;
+}
+
+void Chooser::on_type_choice(int i) {
+  const Entry &e = entries[sel];
+  ContentType t = i == 0 ? CONTENT_MANGA : i == 1 ? CONTENT_BOOK : CONTENT_UNKNOWN;
+  Library_SetMark(e.path, t);
+  overlay = OV_NONE;
+}
+
+void Chooser::edit_notes() {
+  SwkbdConfig kbd;
+  if (R_FAILED(swkbdCreate(&kbd, 0))) return;
+  swkbdConfigMakePresetDefault(&kbd);
+  swkbdConfigSetType(&kbd, SwkbdType_Normal);
+  swkbdConfigSetHeaderText(&kbd, "Notes");
+  swkbdConfigSetStringLenMax(&kbd, 2000);
+  swkbdConfigSetBlurBackground(&kbd, 1);
+  swkbdConfigSetInitialText(&kbd, notes_text.c_str());
+  vector<char> buf(8192, 0);
+  Result rc = swkbdShow(&kbd, buf.data(), buf.size());
+  swkbdClose(&kbd);
+  if (R_SUCCEEDED(rc)) {
+    notes_text = buf.data();
+    Notes_Write(notes_path, notes_text);
+  }
+}
+
+static string on_off(bool b) { return b ? "On" : "Off"; }
+
+void Chooser::build_settings() {
+  static Settings &s = g_settings;
+  auto flag = [this](bool &b) {
+    bool *pb = &b;
+    return [this, pb](int) {
+      *pb = !*pb;
+      settings_dirty = true;
+    };
+  };
+  auto cycle = [this](int &v, int lo, int hi) {
+    int *pv = &v;
+    return [this, pv, lo, hi](int d) {
+      int n = hi - lo + 1;
+      *pv = lo + ((*pv - lo + d) % n + n) % n;
+      settings_dirty = true;
+    };
+  };
+  static const char *topbar[] = {"Always hidden", "Tap to show", "Always shown"};
+  static const char *orient[] = {"Auto", "Landscape", "Portrait (R on top)", "Portrait (L on top)"};
+  static const char *tsize[] = {"Small", "Medium", "Large", "Extra large"};
+
+  cats = {
+      {"Appearance",
+       {
+           {"Theme", "Dark uses black backgrounds everywhere. Press - anywhere to switch.",
+            [] { return string(s.dark_mode ? "Dark" : "Light"); }, flag(s.dark_mode)},
+           {"Library columns", "Covers per row in landscape (portrait uses fewer). ZL / ZR also change it.",
+            [] { return std::to_string(s.grid_cols); }, cycle(s.grid_cols, 3, 8)},
+       }},
+      {"Reading",
+       {
+           {"Top bar", "Title, battery and menu bar while reading. 'Tap to show': tap the middle of the page or press X.",
+            [] { return string(topbar[s.top_bar]); }, cycle(s.top_bar, 0, 2)},
+           {"Page & battery indicator", "Shows the page number and battery in its own strip at the side of the screen, never covering the page.",
+            [] { return on_off(s.indicator); }, flag(s.indicator)},
+           {"Indicator position", "Which edge the indicator sits on (in reading orientation).",
+            [] { return string(s.indicator_pos == INDICATOR_TOP ? "Top left" : "Bottom left"); },
+            cycle(s.indicator_pos, 0, 1)},
+           {"Clock in indicator", "Adds the time next to the battery.",
+            [] { return on_off(s.indicator_clock); }, flag(s.indicator_clock)},
+           {"Default page fit", "Fit page shows the whole page. Fit width fills the screen width and scrolls. Y switches while reading.",
+            [] { return string(s.fit_mode == FIT_WIDTH ? "Fit width" : "Fit page"); }, cycle(s.fit_mode, 0, 1)},
+           {"Book text size", "Text size for EPUB, FB2, HTML and TXT books.",
+            [] { return string(tsize[s.text_size]); }, cycle(s.text_size, 0, 3)},
+           {"On-screen arrows", "Faint page-turn arrows at the screen edges that fade after 3 seconds.",
+            [] { return on_off(s.screen_buttons); }, flag(s.screen_buttons)},
+       }},
+      {"Rotation",
+       {
+           {"Screen rotation", "Auto uses the motion sensor: hold the Switch upright like a book and the page turns with it.",
+            [] { return string(orient[s.orientation]); }, cycle(s.orientation, 0, 3)},
+           {"Auto-rotate direction", "If auto-rotate shows pages upside down, switch this to Reversed.",
+            [] { return string(s.rotate_reverse ? "Reversed" : "Normal"); }, flag(s.rotate_reverse)},
+           {"Sensor test", "Shows live motion sensor values and the detected rotation.",
+            [] { return string(); }, [this](int) { overlay = OV_SENSOR; }},
+       }},
+      {"Manga & dark mode",
+       {
+           {"Ask manga or book", "When a file has no type yet, ask on first open. Off: archives and image folders are manga, documents are books.",
+            [] { return on_off(s.ask_type); }, flag(s.ask_type)},
+           {"Manga reading direction", "Right to left swaps tap zones, swipes, the D-pad and two-page spreads for manga.",
+            [] { return string(s.manga_rtl ? "Right to left" : "Left to right"); }, flag(s.manga_rtl)},
+       }},
+      {"Controls",
+       {
+           {"Tap sides to turn pages", "Tap the left or right 30% of the screen to turn the page.",
+            [] { return on_off(s.tap_zones); }, flag(s.tap_zones)},
+           {"Swipe to turn pages", "Swipe sideways when the page fits the screen width.",
+            [] { return on_off(s.swipe_turn); }, flag(s.swipe_turn)},
+           {"Stick scroll speed", "How fast the left stick moves a zoomed page.",
+            [] { return std::to_string(s.scroll_speed); }, cycle(s.scroll_speed, 1, 4)},
+           {"Zoom speed", "How fast the right stick zooms.",
+            [] { return std::to_string(s.zoom_step); }, cycle(s.zoom_step, 1, 4)},
+       }},
+      {"Storage",
+       {
+           {"Cache size", "Space on the SD card used by saved covers, page lists and converted text books.",
+            [this] { return cache_usage_text(); }, [](int) {}, true},
+           {"Clear cache", "Deletes all saved covers and page lists. Your books, reading progress, notes and settings are not touched.",
+            [] { return string(); },
+            [this](int) {
+              confirm_action = [this] {
+                Library_ClearCaches();
+                g_cover_cache.clear();
+                for (auto &e : entries) e.cover_state = 0;
+                cache_dirty = true;
+              };
+              menu = ListMenu();
+              menu.title = "Clear cache?";
+              menu.subtitle = "This frees " + cache_usage_text();
+              menu.min_w = 720;
+              menu.items = {{"Clear cache", "", "Covers are rebuilt as you browse (slower the first time)"},
+                            {"Cancel", "", "Books, progress, notes and settings are always kept"}};
+              menu.sel = 1;
+              overlay = OV_CONFIRM;
+            }},
+           {"Clear reading history", "Empties 'Recently opened'. Reading positions are kept.",
+            [] { return string(); },
+            [this](int) {
+              confirm_action = [] { Recent_Clear(); };
+              menu = ListMenu();
+              menu.title = "Clear reading history?";
+              menu.items = {{"Clear", "", ""}, {"Cancel", "", ""}};
+              menu.sel = 1;
+              overlay = OV_CONFIRM;
+            }},
+           {"Books folder", "Copy books, comics and folders here on your SD card.",
+            [] { return string(BOOKS_DIR); }, [](int) {}, true},
+           {"Version", "BookReader (based on WookReader)", [] { return string(APP_VERSION_STR); }, [](int) {}, true},
+       }},
+  };
+}
+
+// ── input ────────────────────────────────────────────────────────────────────
+
+void Chooser::overlay_input(u64 kDown, int dirs) {
+  if (overlay == OV_APPLET) {
+    MenuResult r = menu.input(0, kDown, touch);
+    if (r.activated >= 0 || r.closed) overlay = OV_NONE;
+    return;
+  }
+  if (overlay == OV_TYPE || overlay == OV_CONFIRM) {
+    MenuResult r = menu.input(dirs & (DIR_UP | DIR_DOWN), kDown, touch);
+    if (r.activated >= 0) {
+      if (overlay == OV_TYPE) {
+        on_type_choice(r.activated);
+      } else {
+        if (r.activated == 0 && confirm_action) confirm_action();
+        overlay = OV_NONE;
+      }
+    } else if (r.closed) {
+      overlay = OV_NONE;
+    }
+  } else if (overlay == OV_NOTES) {
+    if (kDown & HidNpadButton_A) edit_notes();
+    if ((kDown & (HidNpadButton_B | HidNpadButton_Y)) || touch.tapped) overlay = OV_NONE;
+  } else if (overlay == OV_SENSOR) {
+    if ((kDown & (HidNpadButton_B | HidNpadButton_A)) || touch.tapped) overlay = OV_NONE;
+  }
+}
+
+void Chooser::library_input(u64 kDown, int dirs) {
+  if (dirs) move_sel(dirs);
+  if (kDown & HidNpadButton_A) open_selected();
+  if (kDown & HidNpadButton_B) {
+    if (!go_back()) quit = true;
+  }
+  if (kDown & HidNpadButton_X) open_type_dialog();
+  if ((kDown & HidNpadButton_Y) && sel < (int)entries.size() && entries[sel].kind == E_BOOK) {
+    notes_path = entries[sel].path;
+    notes_text = Notes_Read(notes_path);
+    overlay = OV_NOTES;
+  }
+  if (kDown & HidNpadButton_Plus) {
+    settings_open = true;
+    cache_dirty = true;
+    focus = 0;
+    item = 0;
+  }
+  if (kDown & HidNpadButton_Minus) {
+    g_settings.dark_mode = !g_settings.dark_mode;
+    settings_dirty = true;
+  }
+  if (kDown & (HidNpadButton_ZL | HidNpadButton_ZR)) {
+    int c = g_settings.grid_cols + ((kDown & HidNpadButton_ZL) ? 1 : -1);
+    if (c >= 3 && c <= 8) {
+      g_settings.grid_cols = c;
+      settings_dirty = true;
+      layout_dirty = true;
+    }
+  }
+}
+
+void Chooser::library_touch() {
+  if (touch.count == 1 && touch.dragging && touch.prev_count == 1) {
+    scroll -= touch.y - touch.prev_y;
+    fling = 0;
+  }
+  if (touch.released && touch.dragging && !touch.multi) fling = -touch.vel_y;
+  if (!touch.tapped) return;
+
+  float x = touch.start_x, y = touch.start_y;
+  for (auto &c : chips) {
+    SDL_Point p = {(int)x, (int)y};
+    if (SDL_PointInRect(&p, &c.r)) {
+      u64 b = c.button;
+      library_input(b, 0);
+      return;
+    }
+  }
+  SDL_Point p = {(int)x, (int)y};
+  if (back_rect.w && SDL_PointInRect(&p, &back_rect)) {
+    if (!go_back()) quit = true;
+    return;
+  }
+  int i = hit_test(x, y);
+  if (i >= 0) {
+    sel = i;
+    open_selected();
+  }
+}
+
+void Chooser::settings_input(u64 kDown, int dirs) {
+  int ncat = (int)cats.size();
+  if (kDown & HidNpadButton_L) { cat = (cat + ncat - 1) % ncat; item = 0; }
+  if (kDown & HidNpadButton_R) { cat = (cat + 1) % ncat; item = 0; }
+  int nitems = (int)cats[cat].items.size();
+  if (focus == 0) {
+    if (dirs & DIR_UP) cat = (cat + ncat - 1) % ncat;
+    if (dirs & DIR_DOWN) cat = (cat + 1) % ncat;
+    if ((dirs & DIR_RIGHT) || (kDown & HidNpadButton_A)) { focus = 1; item = 0; }
+    if (kDown & (HidNpadButton_B | HidNpadButton_Plus)) settings_open = false;
+  } else {
+    if (dirs & DIR_UP) item = (item + nitems - 1) % nitems;
+    if (dirs & DIR_DOWN) item = (item + 1) % nitems;
+    SettingDef &d = cats[cat].items[item];
+    bool is_value = !d.value().empty() && !d.info;
+    if (dirs & DIR_RIGHT) d.change(+1);
+    if (dirs & DIR_LEFT) {
+      if (is_value) d.change(-1); else focus = 0;
+    }
+    if (kDown & HidNpadButton_A) d.change(+1);
+    if (kDown & HidNpadButton_B) focus = 0;
+    if (kDown & HidNpadButton_Plus) settings_open = false;
+  }
+  if (kDown & HidNpadButton_Minus) {
+    g_settings.dark_mode = !g_settings.dark_mode;
+    settings_dirty = true;
+  }
+  if (!settings_open) {
+    if (settings_dirty) Settings_Save();
+    settings_dirty = false;
+    layout_dirty = true;
+  }
+}
+
+void Chooser::settings_touch() {
+  if (!touch.tapped) return;
+  SDL_Point p = {(int)touch.start_x, (int)touch.start_y};
+  if (back_rect.w && SDL_PointInRect(&p, &back_rect)) {
+    settings_input(HidNpadButton_Plus, 0);
+    return;
+  }
+  for (int i = 0; i < (int)cat_rects.size(); i++)
+    if (SDL_PointInRect(&p, &cat_rects[i])) {
+      cat = i;
+      item = 0;
+      focus = 0;
+      return;
+    }
+  for (int i = 0; i < (int)item_rects.size(); i++)
+    if (SDL_PointInRect(&p, &item_rects[i])) {
+      focus = 1;
+      item = i;
+      SDL_Rect r = item_rects[i];
+      bool left_half = p.x < r.x + r.w / 2;
+      SettingDef &d = cats[cat].items[i];
+      d.change(!d.value().empty() && !d.info && left_half ? -1 : +1);
+      return;
+    }
+  for (auto &c : chips)
+    if (SDL_PointInRect(&p, &c.r)) {
+      settings_input(c.button, 0);
+      return;
+    }
+}
+
+// ── drawing ──────────────────────────────────────────────────────────────────
+
+static const SDL_Color WHITE_C = {255, 255, 255, 255};
+
+void Chooser::draw_header(const string &title, const string &sub, bool back) {
+  const Theme &t = UI_Theme();
+  int x = PAD;
+  int title_y = sub.empty() ? (HEADER_H - UI_TextH(FONT_32)) / 2 : 12;
+  if (back) {
+    UI_Text(FONT_40, x - 4, title_y + (UI_TextH(FONT_32) - UI_TextH(FONT_40)) / 2 - 3, t.text,
+            "\xE2\x80\xB9");
+    x += 30;
+  }
+
+  // Right: battery + clock
+  int right = W - PAD;
+  string clock = UI_Clock();
+  int cw = UI_TextW(FONT_20, clock);
+  int cy = HEADER_H / 2;
+  UI_Text(FONT_20, right - cw, cy - UI_TextH(FONT_20) / 2, t.dim, clock);
+  right -= cw + 18;
+  int bw = UI_BatteryW(FONT_20, true);
+  UI_Battery(right - bw, cy, t.dim, FONT_20, true);
+  right -= bw + 24;
+  if (App_IsAppletMode()) {
+    int pw = UI_TextW(FONT_14, "APPLET MODE") + 16;
+    UI_Pill(right - pw, cy - (UI_TextH(FONT_14) + 4) / 2, FONT_14, "APPLET MODE", t.manga, WHITE_C);
+    right -= pw + 16;
+  }
+
+  string tt = UI_Ellipsize(FONT_32, title, right - x);
+  UI_Text(FONT_32, x, title_y, t.text, tt);
+  if (!sub.empty()) UI_Text(FONT_16, x, title_y + UI_TextH(FONT_32), t.dim, UI_Ellipsize(FONT_16, sub, right - x));
+  if (back) back_rect = {0, 0, std::min(W / 2, x + UI_TextW(FONT_32, tt) + 24), HEADER_H};
+  UI_Fill(PAD, HEADER_H - 1, W - 2 * PAD, 1, t.border);
+}
+
+void Chooser::draw_footer(const vector<HintDef> &hints, const string &left) {
+  const Theme &t = UI_Theme();
+  int y = H - FOOTER_H, cy = y + FOOTER_H / 2;
+  UI_Fill(0, y, W, FOOTER_H, t.surface);
+  UI_Fill(0, y, W, 1, t.border);
+  int total = 0;
+  for (auto &h : hints) total += UI_HintW(h.btn, h.label) + 24;
+  int x = W - PAD - total + 24;
+  int start = x;
+  for (auto &h : hints) {
+    int w = UI_Hint(x, cy, h.btn, h.label, t.text);
+    chips.push_back({{x - 8, y, w + 16, FOOTER_H}, h.button});
+    x += w + 24;
+  }
+  if (!left.empty() && start - PAD - 24 > UI_TextW(FONT_18, left))
+    UI_Text(FONT_18, PAD, cy - UI_TextH(FONT_18) / 2, t.dim, left);
+}
+
+void Chooser::draw_continue_card(Entry &e, SDL_Rect r, bool selected) {
+  const Theme &t = UI_Theme();
+  if (selected) UI_RoundOutline(r.x - 4, r.y - 4, r.w + 8, r.h + 8, 22, 3, t.accent);
+  UI_RoundRect(r.x, r.y, r.w, r.h, 18, selected ? t.surface2 : t.surface);
+
+  int ch = r.h - 28, cw = (int)(ch / 1.45f);
+  SDL_Rect cr = {r.x + 14, r.y + 14, cw, ch};
+  SDL_Texture *tex = e.cover != COVER_NONE ? g_cover_cache.get(e.path) : nullptr;
+  if (tex)
+    SDL_RenderCopy(RENDERER, tex, nullptr, &cr);
+  else
+    UI_RoundRect(cr.x, cr.y, cr.w, cr.h, 8, t.surface2);
+
+  int tx = cr.x + cw + 24, tw = r.x + r.w - 24 - tx;
+  bool wide = W >= 1000;
+  int hint_w = wide ? UI_HintW("A", e.label == "UP NEXT" ? "Start" : "Continue") + 8 : 0;
+  int y = r.y + 18;
+  UI_Text(FONT_16, tx, y, t.accent, e.label);
+  y += UI_TextH(FONT_16) + 4;
+  std::vector<string> title = UI_Wrap(FONT_28, e.name, tw - hint_w, wide ? 2 : 3);
+  for (auto &l : title) {
+    UI_Text(FONT_28, tx, y, t.text, l);
+    y += UI_TextH(FONT_28);
+  }
+  string status = e.total > 0 ? "Page " + std::to_string(std::min(e.last + 1, e.total)) + " of " +
+                                    std::to_string(e.total)
+                              : "Not started";
+  int by = r.y + r.h - 34;
+  UI_Text(FONT_18, tx, by - UI_TextH(FONT_18) - 6, t.dim, status);
+  int bar_w = tw - hint_w;
+  UI_RoundRect(tx, by, bar_w, 6, 3, t.surface2);
+  if (e.total > 0) {
+    float f = std::min(1.0f, (e.last + 1) / (float)e.total);
+    UI_RoundRect(tx, by, std::max(6, (int)(bar_w * f)), 6, 3, t.accent);
+  }
+  if (wide)
+    UI_Hint(r.x + r.w - 24 - hint_w + 8, r.y + r.h / 2, "A", e.label == "UP NEXT" ? "Start" : "Continue",
+            t.text);
+}
+
+void Chooser::draw_folder_card(const Entry &e, SDL_Rect r, bool selected) {
+  const Theme &t = UI_Theme();
+  if (selected) UI_RoundOutline(r.x - 4, r.y - 4, r.w + 8, r.h + 8, 18, 3, t.accent);
+  UI_RoundRect(r.x, r.y, r.w, r.h, 14, selected ? t.surface2 : t.surface);
+
+  SDL_Texture *icon = e.kind == E_IMAGES ? blue_book : blue_folder;
+  if (icon) {
+    if (e.kind == E_RECENT) SDL_SetTextureColorMod(icon, t.accent.r, t.accent.g, t.accent.b);
+    SDL_DrawImageScale(RENDERER, icon, r.x + 16, r.y + (r.h - 36) / 2, 36, 36);
+    SDL_SetTextureColorMod(icon, 255, 255, 255);
+  }
+
+  int pill_w = 0;
+  ContentType mark = e.kind == E_RECENT ? CONTENT_UNKNOWN : Library_GetMark(e.path);
+  const char *pill = mark == CONTENT_MANGA ? "MANGA" : mark == CONTENT_BOOK ? "BOOKS" : nullptr;
+  if (pill) pill_w = UI_TextW(FONT_14, pill) + 16 + 12;
+  SDL_Color fg = e.kind == E_RECENT ? t.accent : t.text;
+  int tx = r.x + 66;
+  UI_Text(FONT_22, tx, r.y + (r.h - UI_TextH(FONT_22)) / 2, fg,
+          UI_Ellipsize(FONT_22, e.name, r.x + r.w - 16 - pill_w - tx));
+  if (pill) {
+    int pw = UI_TextW(FONT_14, pill) + 16;
+    UI_Pill(r.x + r.w - 16 - pw, r.y + (r.h - UI_TextH(FONT_14) - 4) / 2, FONT_14, pill,
+            mark == CONTENT_MANGA ? t.manga : t.book, WHITE_C);
+  }
+}
+
+void Chooser::draw_book_cell(Entry &e, SDL_Rect r, bool selected) {
+  const Theme &t = UI_Theme();
+  SDL_Rect cr = {r.x, r.y, cover_w, cover_h};
+  if (selected) UI_RoundOutline(cr.x - 6, cr.y - 6, cr.w + 12, cr.h + 12, 12, 4, t.accent);
+
+  SDL_Texture *tex = e.cover != COVER_NONE ? g_cover_cache.get(e.path) : nullptr;
+  if (tex) {
+    SDL_RenderCopy(RENDERER, tex, nullptr, &cr);
+  } else {
+    UI_RoundRect(cr.x, cr.y, cr.w, cr.h, 8, t.surface2);
+    int is = std::min(64, cr.w / 3);
+    if (blue_book) SDL_DrawImageScale(RENDERER, blue_book, cr.x + (cr.w - is) / 2, cr.y + cr.h / 2 - is, is, is);
+    string ext = e.cover == COVER_DIR ? "FOLDER" : Library_Ext(e.path);
+    if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+    for (char &c : ext) c = (char)toupper((unsigned char)c);
+    UI_TextC(FONT_16, cr.x + cr.w / 2, cr.y + cr.h / 2 + 10, t.dim, ext);
+  }
+
+  // Reading progress along the bottom of the cover.
+  if (e.total > 0) {
+    float f = std::min(1.0f, (e.last + 1) / (float)e.total);
+    UI_Fill(cr.x, cr.y + cr.h - 5, cr.w, 5, SDL_Color{0, 0, 0, 150});
+    UI_Fill(cr.x, cr.y + cr.h - 5, (int)(cr.w * f), 5, t.accent);
+  }
+
+  ContentType ct = Library_Resolve(e.path);
+  if (ct != CONTENT_UNKNOWN && cr.w >= 120)
+    UI_Pill(cr.x + 6, cr.y + 6, FONT_14, ct == CONTENT_MANGA ? "MANGA" : "BOOK",
+            ct == CONTENT_MANGA ? t.manga : t.book, WHITE_C);
+  if (Notes_Exists(e.path)) {
+    int nw = UI_TextW(FONT_14, "NOTE") + 16;
+    UI_Pill(cr.x + cr.w - nw - 6, cr.y + 6, FONT_14, "NOTE", SDL_Color{0, 0, 0, 170}, WHITE_C);
+  }
+
+  int ty = cr.y + cr.h + 8;
+  UI_Text(FONT_18, cr.x, ty, selected ? t.accent : t.text, UI_Ellipsize(FONT_18, e.name, cr.w));
+  string status;
+  if (e.total > 0) {
+    int pct = (e.last + 1) * 100 / e.total;
+    status = e.last + 1 >= e.total ? "Finished" : std::to_string(std::max(1, pct)) + "%  \xC2\xB7  page " +
+                                                      std::to_string(e.last + 1) + " of " + std::to_string(e.total);
+  } else {
+    status = "New";
+  }
+  UI_Text(FONT_16, cr.x, ty + UI_TextH(FONT_18) + 2, t.dim, UI_Ellipsize(FONT_16, status, cr.w));
+}
+
+void Chooser::draw_library() {
+  const Theme &t = UI_Theme();
+  if (layout_dirty) relayout();
+
+  string title, sub;
+  bool back = in_recent || path != root;
+  if (in_recent) {
+    title = "Recently opened";
+  } else if (path == root) {
+    title = "Library";
+  } else {
+    title = path.substr(path.find_last_of('/') + 1);
+    string rel = path.substr(root.size());
+    sub = "Library";
+    size_t pos = 1;
+    while (pos < rel.size()) {
+      size_t nx = rel.find('/', pos);
+      if (nx == string::npos) nx = rel.size();
+      sub += "  \xE2\x80\xBA  " + rel.substr(pos, nx - pos);
+      pos = nx + 1;
+    }
+  }
+  draw_header(title, sub, back);
+
+  SDL_Rect clip = {0, HEADER_H, W, view_h()};
+  SDL_RenderSetClipRect(RENDERER, &clip);
+  for (size_t i = 0; i < section_y.size(); i++) {
+    int y = HEADER_H + section_y[i] - (int)scroll;
+    if (!section_name[i].empty()) UI_Text(FONT_20, PAD, y + 4, t.dim, section_name[i]);
+  }
+  for (int i = 0; i < (int)entries.size(); i++) {
+    SDL_Rect r = rects[i];
+    r.y = HEADER_H + r.y - (int)scroll;
+    if (r.y + r.h < HEADER_H - 10 || r.y > H - FOOTER_H + 10) continue;
+    if (i < num_cards)
+      entries[i].kind == E_CONTINUE ? draw_continue_card(entries[i], r, i == sel)
+                                    : draw_folder_card(entries[i], r, i == sel);
+    else
+      draw_book_cell(entries[i], r, i == sel);
+  }
+  if (entries.empty()) {
+    int cy = HEADER_H + view_h() / 2;
+    if (path == root && !in_recent) {
+      UI_TextC(FONT_28, W / 2, cy - 50, t.text, "Your library is empty");
+      UI_TextC(FONT_20, W / 2, cy, t.dim, "Copy books, comics or folders to");
+      UI_TextC(FONT_20, W / 2, cy + 30, t.accent, BOOKS_DIR);
+    } else {
+      UI_TextC(FONT_25, W / 2, cy - 15, t.dim, "Nothing here yet");
+    }
+  }
+  // Scrollbar
+  if (content_h > view_h()) {
+    int vh = view_h();
+    int bar_h = std::max(40, vh * vh / content_h);
+    int bar_y = HEADER_H + (int)((vh - bar_h) * (scroll / (content_h - vh)));
+    UI_RoundRect(W - 8, bar_y, 4, bar_h, 2, t.border);
+  }
+  SDL_RenderSetClipRect(RENDERER, nullptr);
+
+  vector<HintDef> hints;
+  bool book = sel < (int)entries.size() && entries[sel].kind == E_BOOK;
+  bool markable = sel < (int)entries.size() && entries[sel].kind != E_RECENT &&
+                  entries[sel].kind != E_CONTINUE;
+  hints.push_back({"A", "Open", HidNpadButton_A});
+  hints.push_back({"B", back ? "Back" : "Exit", HidNpadButton_B});
+  if (markable) hints.push_back({"X", "Manga / book", HidNpadButton_X});
+  if (W >= 1000) {
+    if (book) hints.push_back({"Y", "Notes", HidNpadButton_Y});
+    hints.push_back({"-", "Theme", HidNpadButton_Minus});
+  }
+  hints.push_back({"+", "Settings", HidNpadButton_Plus});
+  int nbooks = (int)entries.size() - num_cards;
+  string left = nbooks > 0 ? std::to_string(nbooks) + (nbooks == 1 ? " book" : " books") : "";
+  draw_footer(hints, left);
+}
+
+void Chooser::draw_settings() {
+  const Theme &t = UI_Theme();
+  draw_header("Settings", "", true);
+  cat_rects.clear();
+  item_rects.clear();
+
+  int sb_w = W >= 1000 ? 300 : 236;
+  int top = HEADER_H + 16;
+  for (int i = 0; i < (int)cats.size(); i++) {
+    SDL_Rect r = {PAD - 8, top + i * 58, sb_w - PAD, 50};
+    cat_rects.push_back(r);
+    bool selc = i == cat;
+    if (selc) {
+      UI_RoundRect(r.x, r.y, r.w, r.h, 12, focus == 0 ? t.surface2 : t.surface);
+      if (focus == 0) UI_Fill(r.x, r.y + 12, 4, r.h - 24, t.accent);
+    }
+    UI_Text(FONT_22, r.x + 18, r.y + (r.h - UI_TextH(FONT_22)) / 2, selc ? t.text : t.dim,
+            UI_Ellipsize(FONT_22, cats[i].name, r.w - 26));
+  }
+
+  int px = sb_w + 8, pw = W - px - PAD;
+  int ph = H - FOOTER_H - top - 16;
+  UI_RoundRect(px, top, pw, ph, 16, t.surface);
+  const SettingCat &c = cats[cat];
+  int row_h = 54;
+  for (int j = 0; j < (int)c.items.size(); j++) {
+    const SettingDef &d = c.items[j];
+    SDL_Rect r = {px + 10, top + 10 + j * (row_h + 4), pw - 20, row_h};
+    item_rects.push_back(r);
+    bool selr = focus == 1 && j == item;
+    if (selr) {
+      UI_RoundRect(r.x, r.y, r.w, r.h, 12, t.surface2);
+      UI_Fill(r.x, r.y + 14, 4, r.h - 28, t.accent);
+    }
+    int ty = r.y + (r.h - UI_TextH(FONT_22)) / 2;
+    string v = d.value();
+    int vx = r.x + r.w - 18;
+    int used = 0;
+    if (d.info) {
+      string vv = UI_Ellipsize(FONT_18, v, r.w / 2);
+      UI_TextR(FONT_18, vx, r.y + (r.h - UI_TextH(FONT_18)) / 2, t.dim, vv);
+      used = UI_TextW(FONT_18, vv) + 24;
+    } else if (!v.empty()) {
+      SDL_Color vc = selr ? t.accent : t.dim;
+      UI_TextR(FONT_22, vx, ty, vc, "\xE2\x80\xBA");
+      int vw = UI_TextW(FONT_22, v);
+      UI_Text(FONT_22, vx - 18 - vw, ty, selr ? t.text : t.dim, v);
+      UI_TextR(FONT_22, vx - 26 - vw, ty, vc, "\xE2\x80\xB9");
+      used = vw + 60;
+    } else {
+      UI_TextR(FONT_22, vx, ty, t.dim, "\xE2\x80\xBA");
+      used = 30;
+    }
+    UI_Text(FONT_22, r.x + 18, ty, t.text, UI_Ellipsize(FONT_22, d.label, r.w - 36 - used));
+  }
+  // Description of the highlighted setting
+  int di = focus == 1 ? item : -1;
+  if (di >= 0 && di < (int)c.items.size()) {
+    vector<string> lines = UI_Wrap(FONT_18, c.items[di].desc, pw - 48, 3);
+    int lh = UI_TextH(FONT_18) + 4;
+    int y = top + ph - 20 - (int)lines.size() * lh;
+    UI_Fill(px + 24, y - 14, pw - 48, 1, t.border);
+    for (auto &l : lines) {
+      UI_Text(FONT_18, px + 24, y, t.dim, l);
+      y += lh;
+    }
+  }
+
+  vector<HintDef> hints;
+  if (focus == 0) {
+    hints.push_back({"A", "Select", HidNpadButton_A});
+    hints.push_back({"B", "Close", HidNpadButton_B});
+  } else {
+    hints.push_back({"A", "Change", HidNpadButton_A});
+    hints.push_back({"B", "Back", HidNpadButton_B});
+  }
+  if (W >= 1000) hints.push_back({"R", "Next category", HidNpadButton_R});
+  draw_footer(hints, "");
+}
+
+void Chooser::draw_overlay() {
+  const Theme &t = UI_Theme();
+  if (overlay == OV_TYPE || overlay == OV_CONFIRM || overlay == OV_APPLET) {
+    menu.draw();
+  } else if (overlay == OV_NOTES) {
+    UI_Fill(0, 0, W, H, t.scrim);
+    int pw = std::min(W - 40, 820), ph = std::min(H - 80, 520);
+    int px = (W - pw) / 2, py = (H - ph) / 2;
+    UI_RoundRect(px, py, pw, ph, 18, t.surface);
+    UI_Text(FONT_28, px + 28, py + 24, t.text, "Notes");
+    UI_Text(FONT_18, px + 28, py + 28 + UI_TextH(FONT_28), t.dim,
+            UI_Ellipsize(FONT_18, Library_DisplayName(notes_path), pw - 56));
+    int body_y = py + 100, hint_y = py + ph - 44;
+    if (notes_text.empty())
+      UI_Text(FONT_22, px + 28, body_y, t.dim, "No notes yet.");
+    else
+      SDL_DrawTextWrapped(RENDERER, FONT_20, px + 28, body_y, pw - 56, hint_y - body_y - 12, t.text,
+                          notes_text.c_str());
+    int x = px + 28;
+    x += UI_Hint(x, hint_y + 16, "A", "Edit", t.text) + 24;
+    UI_Hint(x, hint_y + 16, "B", "Close", t.text);
+  } else if (overlay == OV_SENSOR) {
+    UI_Fill(0, 0, W, H, t.scrim);
+    int pw = std::min(W - 40, 640), ph = 380;
+    int px = (W - pw) / 2, py = (H - ph) / 2;
+    UI_RoundRect(px, py, pw, ph, 18, t.surface);
+    UI_Text(FONT_28, px + 28, py + 24, t.text, "Motion sensor");
+    float ax, ay, az;
+    bool ok = Orientation_Raw(&ax, &ay, &az);
+    char buf[128];
+    int y = py + 90;
+    if (ok) {
+      snprintf(buf, sizeof(buf), "x %+.2f    y %+.2f    z %+.2f", ax, ay, az);
+      UI_Text(FONT_25, px + 28, y, t.text, buf);
+    } else {
+      UI_Text(FONT_22, px + 28, y, t.dim, "No reading (docked or Joy-Cons detached)");
+    }
+    snprintf(buf, sizeof(buf), "Detected rotation: %d\xC2\xB0", Orientation_Rotation());
+    UI_Text(FONT_22, px + 28, y + 50, t.accent, buf);
+    vector<string> lines = UI_Wrap(FONT_18,
+                                   "Stand the Switch on its side: the rotation should change after a "
+                                   "moment. If pages come out upside down, set Auto-rotate direction to "
+                                   "Reversed.",
+                                   pw - 56, 4);
+    int ly = y + 100;
+    for (auto &l : lines) {
+      UI_Text(FONT_18, px + 28, ly, t.dim, l);
+      ly += UI_TextH(FONT_18) + 4;
+    }
+    UI_Hint(px + 28, py + ph - 30, "B", "Close", t.text);
+  }
+}
+
+void Chooser::draw() {
+  const Theme &t = UI_Theme();
+  Screen_Begin(rot);
+  W = Screen_W();
+  H = Screen_H();
+  UI_Fill(0, 0, W, H, t.bg);
+  chips.clear();
+  back_rect = {0, 0, 0, 0};
+  if (settings_open)
+    draw_settings();
+  else
+    draw_library();
+  draw_overlay();
+  Screen_End();
+}
+
+// ── main loop ────────────────────────────────────────────────────────────────
+
+void Chooser::run() {
+  while (!quit && appletMainLoop()) {
     SDL_TextCache_NextFrame();
-    SDL_PumpEvents();  // drain SDL's internal event queue to prevent HID interference
-    SDL_Color textColor    = configDarkMode ? WHITE : BLACK;
-    SDL_Color backColor    = configDarkMode ? BACK_BLACK : BACK_WHITE;
-    SDL_Color selectorColor = configDarkMode ? SELECTOR_COLOUR_DARK
-                                             : SELECTOR_COLOUR_LIGHT;
+    SDL_PumpEvents();
 
-    SDL_ClearScreen(RENDERER, backColor);
-    SDL_RenderClear(RENDERER);
+    Orientation_Update();
+    int r = Orientation_Rotation();
+    if (r != rot) {
+      rot = r;
+      Screen_Begin(rot);  // touch mapping follows immediately
+      W = Screen_W();
+      H = Screen_H();
+      layout_dirty = true;
+    }
+    if (layout_dirty) relayout();
 
     padUpdate(&pad);
     u64 kDown = padGetButtonsDown(&pad);
-    u64 kUp   = padGetButtonsUp(&pad);
+    u64 kHeld = padGetButtons(&pad);
+    touch.update();
+    int dirs = keys.update(kDown, kHeld);
 
-    // ── Input ────────────────────────────────────────────────────────────────
-
-    if (kUp & HidNpadButton_Plus) {
-      if (drawOption) {
-        // Closing options menu — save immediately
-        save_config(chosenFolderColor, chosenBookColor, scroll_option,
-                    zoom_option, configDarkMode);
-      }
-      drawOption = !drawOption;
+    if (overlay != OV_NONE) {
+      overlay_input(kDown, dirs);
+    } else if (settings_open) {
+      settings_input(kDown, dirs);
+      settings_touch();
+    } else {
+      library_input(kDown, dirs);
+      if (!quit && overlay == OV_NONE) library_touch();
     }
+    if (quit) break;
+    if (layout_dirty) relayout();
 
-    if (kDown & HidNpadButton_B) {
-      if (drawOption) {
-        save_config(chosenFolderColor, chosenBookColor, scroll_option,
-                    zoom_option, configDarkMode);
-        drawOption = false;
-      } else if (drawNotesChooser) {
-        drawNotesChooser = false;
-      } else if (inRecentFolder) {
-        inRecentFolder = false;
-        enter_directory(path);
-      } else if (isWarningOnScreen) {
-        isWarningOnScreen = false;
-      } else if (path == "/switch/WookReader") {
-        save_config(chosenFolderColor, chosenBookColor, scroll_option,
-                    zoom_option, configDarkMode);
-        break;
-      } else {
-        // Navigate to parent directory
-        string parent = path;
-        while (!parent.empty() && parent.back() != '/') parent.pop_back();
-        if (!parent.empty() && parent.back() == '/') parent.pop_back();
-        if (parent.empty()) parent = "/";
-        path = parent;
-        enter_directory(path);
-      }
+    if (fling != 0 && touch.count == 0) {
+      scroll += fling;
+      fling *= 0.92f;
+      if (fabsf(fling) < 0.5f) fling = 0;
     }
-
-    if (kDown & HidNpadButton_A && drawOption) {
-      switch (option_index) {
-        case 0:
-          chosenFolderColor = (chosenFolderColor < COLORS_SIZE)
-                                  ? chosenFolderColor + 1 : 0;
-          folder_image = folder_textures[chosenFolderColor];
-          break;
-        case 1:
-          chosenBookColor = (chosenBookColor < COLORS_SIZE)
-                                ? chosenBookColor + 1 : 0;
-          book_image = book_textures[chosenBookColor];
-          break;
-        case 2:
-          scroll_option = (scroll_option < 4) ? scroll_option + 1 : 1;
-          scroll_speed  = SCROLL * scroll_option;
-          break;
-        case 3:
-          zoom_option  = (zoom_option < 4) ? zoom_option + 1 : 1;
-          zoom_amount  = ZOOM * zoom_option;
-          break;
-        case 4:
-          configScreenButtons = !configScreenButtons;
-          break;
-        case 5:
-          configStatusBar = !configStatusBar;
-          break;
-        default: break;
-      }
-    }
-
-    if (kDown & HidNpadButton_A && !drawOption && !drawNotesChooser &&
-        chosen_index < (int)sorted_entries.size()) {
-      const fs::path& sel = sorted_entries[chosen_index];
-
-      if (sel.string() == RECENT_SENTINEL) {
-        enter_recent();
-      } else {
-        string filename = sel.filename().string();
-        string extention;
-        if (filename.find('.') != string::npos)
-          extention = filename.substr(filename.find_last_of("."));
-        else {
-          std::error_code ec;
-          extention = fs::is_directory(sel, ec) ? "directory" : "none";
-        }
-
-        if (contains(warnedExtentions, extention)) {
-          if (isWarningOnScreen) {
-            isWarningOnScreen = false;
-            string book = sel.string();
-            update_recent(book);
-            Menu_OpenBook((char*)book.c_str(), scroll_speed, zoom_amount);
-            if (inRecentFolder) enter_recent();
-          } else {
-            isWarningOnScreen = true;
-          }
-        } else if (extention == "directory") {
-          path = sel.string();
-          enter_directory(path);
-        } else {
-          string book = sel.string();
-          update_recent(book);
-          Menu_OpenBook((char*)book.c_str(), scroll_speed, zoom_amount);
-          if (inRecentFolder) enter_recent();
-        }
-      }
-    }
-
-    // ── Up / Down navigation ─────────────────────────────────────────────────
-    if (kDown & (HidNpadButton_Up | HidNpadButton_StickRUp)) {
-      if (drawOption) {
-        option_index = (option_index > 0) ? option_index - 1 : amountOfOptions - 1;
-      } else if (!isWarningOnScreen) {
-        if (chosen_index < numFolders) {
-          // Folder list: move up or wrap to last book
-          if (chosen_index > 0)
-            chosen_index--;
-          else
-            chosen_index = amountOfFiles - 1;
-        } else {
-          // Book grid: move up one row or go to last folder
-          int bi  = chosen_index - numFolders;
-          int row = bi / cols;
-          if (row > 0)
-            chosen_index -= cols;
-          else
-            chosen_index = (numFolders > 0) ? numFolders - 1 : amountOfFiles - 1;
-        }
-        update_scroll();
-      }
-    }
-
-    if (kDown & (HidNpadButton_Down | HidNpadButton_StickRDown)) {
-      if (drawOption) {
-        option_index = (option_index == amountOfOptions - 1) ? 0 : option_index + 1;
-      } else if (!isWarningOnScreen) {
-        int numBooks = amountOfFiles - numFolders;
-        if (chosen_index < numFolders) {
-          // Folder list: move down (may cross into book grid)
-          chosen_index++;
-          if (chosen_index >= amountOfFiles) chosen_index = 0;
-        } else {
-          // Book grid: move down one row, clamp to last book, or wrap
-          int bi = chosen_index - numFolders;
-          if (bi + cols < numBooks)
-            chosen_index += cols;
-          else if (chosen_index < amountOfFiles - 1)
-            chosen_index = amountOfFiles - 1;
-          else
-            chosen_index = 0;
-        }
-        update_scroll();
-      }
-    }
-
-    // ── Left / Right navigation (grid columns + option menu) ─────────────────
-    if (kDown & HidNpadButton_Right) {
-      if (drawOption) {
-        switch (option_index) {
-          case 0:
-            chosenFolderColor = (chosenFolderColor < COLORS_SIZE)
-                                    ? chosenFolderColor + 1 : 0;
-            folder_image = folder_textures[chosenFolderColor];
-            break;
-          case 1:
-            chosenBookColor = (chosenBookColor < COLORS_SIZE)
-                                  ? chosenBookColor + 1 : 0;
-            book_image = book_textures[chosenBookColor];
-            break;
-          case 2:
-            scroll_option = (scroll_option < 4) ? scroll_option + 1 : 1;
-            scroll_speed  = SCROLL * scroll_option;
-            break;
-          case 3:
-            zoom_option  = (zoom_option < 4) ? zoom_option + 1 : 1;
-            zoom_amount  = ZOOM * zoom_option;
-            break;
-          case 4:
-            configScreenButtons = !configScreenButtons;
-            break;
-          case 5:
-            configStatusBar = !configStatusBar;
-            break;
-          default: break;
-        }
-      } else if (!isWarningOnScreen && chosen_index >= numFolders) {
-        // Move right within the grid row
-        int bi  = chosen_index - numFolders;
-        int col = bi % cols;
-        if (col < cols - 1 && chosen_index < amountOfFiles - 1) {
-          chosen_index++;
-          update_scroll();
-        }
-      }
-    }
-
-    if (kDown & HidNpadButton_Left) {
-      if (drawOption) {
-        switch (option_index) {
-          case 0:
-            chosenFolderColor = (chosenFolderColor > 0)
-                                    ? chosenFolderColor - 1 : COLORS_SIZE;
-            folder_image = folder_textures[chosenFolderColor];
-            break;
-          case 1:
-            chosenBookColor = (chosenBookColor > 0)
-                                  ? chosenBookColor - 1 : COLORS_SIZE;
-            book_image = book_textures[chosenBookColor];
-            break;
-          case 2:
-            scroll_option = (scroll_option > 1) ? scroll_option - 1 : 4;
-            scroll_speed  = SCROLL * scroll_option;
-            break;
-          case 3:
-            zoom_option = (zoom_option > 1) ? zoom_option - 1 : 4;
-            zoom_amount = ZOOM * zoom_option;
-            break;
-          case 4:
-            configScreenButtons = !configScreenButtons;
-            break;
-          case 5:
-            configStatusBar = !configStatusBar;
-            break;
-          default: break;
-        }
-      } else if (!isWarningOnScreen && chosen_index >= numFolders) {
-        // Move left within the grid row
-        int bi  = chosen_index - numFolders;
-        int col = bi % cols;
-        if (col > 0) {
-          chosen_index--;
-          update_scroll();
-        }
-      }
-    }
-
-    if (kUp & HidNpadButton_Minus) {
-      configDarkMode = !configDarkMode;
-    }
-
-    // ── Y: notes for selected book ────────────────────────────────────────────
-    if (kDown & HidNpadButton_Y) {
-      if (drawNotesChooser) {
-        drawNotesChooser = false;
-      } else if (!drawOption && !isWarningOnScreen &&
-                 chosen_index >= numFolders &&
-                 chosen_index < amountOfFiles) {
-        notesChooserPath = sorted_entries[chosen_index].string();
-        notesChooserText = chooser_note_read(notesChooserPath);
-        drawNotesChooser = true;
-      }
-    }
-
-    // ── Notes overlay input ───────────────────────────────────────────────────
-    if (drawNotesChooser && kDown & HidNpadButton_A) {
-      SwkbdConfig swkbd;
-      swkbdCreate(&swkbd, 0);
-      swkbdConfigSetType(&swkbd, SwkbdType_Normal);
-      swkbdConfigSetHeaderText(&swkbd, "Edit note");
-      swkbdConfigSetStringLenMax(&swkbd, 2000);
-      swkbdConfigSetStringLenMin(&swkbd, 0);
-      swkbdConfigSetBlurBackground(&swkbd, 1);
-      swkbdConfigSetInitialText(&swkbd, notesChooserText.c_str());
-      swkbdConfigSetInitialCursorPos(&swkbd, 1);
-      char buf[2048] = {0};
-      Result rc = swkbdShow(&swkbd, buf, sizeof(buf));
-      swkbdClose(&swkbd);
-      if (R_SUCCEEDED(rc)) {
-        notesChooserText = buf;
-        chooser_note_save(notesChooserPath, notesChooserText);
-      }
-    }
-    // ── Grid zoom (ZR = fewer cols / ZL = more cols) ──────────────────────────
-    if (!drawOption && !isWarningOnScreen) {
-      if ((kDown & HidNpadButton_ZR && cols > 2) ||
-          (kDown & HidNpadButton_ZL && cols < 8)) {
-        if (kDown & HidNpadButton_ZR) cols--;
-        else                          cols++;
-        recalc_grid();
-        trunc_cache.clear();  // cell_w changed, so pixel limits are now different
-        // Repopulate covers from cache as placeholders at old size (rendered scaled).
-        // Reset decode cursor so workers re-decode all covers at new thumb_w/th.
-        int numBooks = amountOfFiles - numFolders;
-        cover_textures.assign(numBooks, nullptr);
-        for (int i = 0; i < numBooks; i++)
-          cover_textures[i] = g_cover_cache.get(sorted_entries[numFolders + i].string());
-        cover_load_index = 0;  // re-decode at new size in background
-        update_scroll();
-      }
-    }
-
-    // ── Touch input ───────────────────────────────────────────────────────────
-    {
-      HidTouchScreenState ts = {0};
-      hidGetTouchScreenStates(&ts, 1);
-
-      if (!drawOption && !isWarningOnScreen)
-      {
-        if (ts.count == 1)
-        {
-          float cx = (float)ts.touches[0].x;
-          float cy = (float)ts.touches[0].y;
-
-          if (touch_prev_count == 0)
-          {
-            touch_start_x  = cx;
-            touch_start_y  = cy;
-            touch_dragging = false;
-          }
-          else if (touch_prev_count == 1)
-          {
-            float dy    = cy - touch_prev_y0;
-            float moved = sqrtf((cx - touch_start_x) * (cx - touch_start_x) +
-                                (cy - touch_start_y) * (cy - touch_start_y));
-            if (moved > 18.0f)
-              touch_dragging = true;
-
-            if (touch_dragging)
-            {
-              // Natural scroll: drag up → content goes up (scroll_y increases)
-              scroll_y -= (int)roundf(dy);
-              int numBooks = amountOfFiles - numFolders;
-              int numRows  = (numBooks + cols - 1) / cols;
-              int total_h  = numFolders * FOLDER_H + numRows * cell_h;
-              int max_sy   = max(0, total_h - (windowY - BOTTOM_H));
-              if (scroll_y < 0)      scroll_y = 0;
-              if (scroll_y > max_sy) scroll_y = max_sy;
-            }
-          }
-
-          touch_prev_y0 = cy;
-        }
-        else if (ts.count == 0 && touch_prev_count == 1 && !touch_dragging)
-        {
-          // Tap: ignore taps in the bottom bar
-          if (touch_start_y < (float)(windowY - BOTTOM_H))
-          {
-            float content_ty = touch_start_y + scroll_y;
-            int   tapped     = -1;
-
-            int folder_idx = (int)(content_ty / FOLDER_H);
-            if (folder_idx >= 0 && folder_idx < numFolders)
-            {
-              tapped = folder_idx;
-            }
-            else
-            {
-              int books_top = numFolders * FOLDER_H;
-              if (content_ty >= books_top)
-              {
-                int rel_y = (int)(content_ty - books_top);
-                int row   = rel_y / cell_h;
-                int col   = (int)(touch_start_x / cell_w);
-                int bi    = row * cols + col;
-                if (bi >= 0 && bi < amountOfFiles - numFolders)
-                  tapped = numFolders + bi;
-              }
-            }
-
-            if (tapped >= 0 && tapped < (int)sorted_entries.size())
-            {
-              chosen_index = tapped;
-              const fs::path& sel = sorted_entries[chosen_index];
-              string filename = sel.filename().string();
-              string extention;
-              if (filename.find('.') != string::npos)
-                extention = filename.substr(filename.find_last_of("."));
-              else {
-                std::error_code ec;
-                extention = fs::is_directory(sel, ec) ? "directory" : "none";
-              }
-
-              if (sel.string() == RECENT_SENTINEL) {
-                enter_recent();
-              } else if (contains(warnedExtentions, extention)) {
-                isWarningOnScreen = true;
-              } else if (extention == "directory") {
-                path = sel.string();
-                enter_directory(path);
-              } else {
-                string book = sel.string();
-                update_recent(book);
-                Menu_OpenBook((char*)book.c_str(), scroll_speed, zoom_amount);
-                if (inRecentFolder) enter_recent();
-              }
-            }
-          }
-        }
-      }
-
-      touch_prev_count = ts.count;
-    }
-
-    // ── Async cover loading ───────────────────────────────────────────────────
-    // Consume completed results from all workers (texture creation must be on main thread)
-    for (int w = 0; w < N_WORKERS; w++) {
-      if (!__atomic_load_n(&cl[w].result_ready, __ATOMIC_ACQUIRE)) continue;
-      int idx = cl[w].result_index;
-      if (__atomic_load_n(&cl[w].stale, __ATOMIC_ACQUIRE)) {
-        // Result is from a previous directory — discard it
-        free(cl[w].result_pixels); cl[w].result_pixels = nullptr;
-        __atomic_store_n(&cl[w].result_ready, 0, __ATOMIC_RELEASE);
-        __atomic_store_n(&cl[w].stale,        0, __ATOMIC_RELEASE);
-        cl_in_flight[w] = -1;
-        continue;
-      }
-      SDL_Texture* tex = pixels_to_texture(cl[w].result_pixels, cl[w].result_iw, cl[w].result_ih);
-      cl[w].result_pixels = nullptr;
-      __atomic_store_n(&cl[w].result_ready, 0, __ATOMIC_RELEASE);
-      cl_in_flight[w] = -1;
-      if (idx >= 0 && idx < (int)cover_textures.size()) {
-        string fpath = sorted_entries[numFolders + idx].string();
-        if (tex) g_cover_cache.put(fpath, tex);
-        cover_textures[idx] = tex;
-      }
-    }
-    // Submit next uncached covers to any idle workers
-    for (int w = 0; w < N_WORKERS; w++) {
-      if (cl_in_flight[w] >= 0) continue;  // this worker is busy
-      // Drain cache hits first — only accept if the cached texture is large
-      // enough for the current thumb size (avoids blurry upscaling on zoom-in).
-      while (cover_load_index < (int)cover_textures.size()) {
-        SDL_Texture* cached = g_cover_cache.get(
-            sorted_entries[numFolders + cover_load_index].string());
-        if (!cached) break;
-        int ctw, cth;
-        SDL_QueryTexture(cached, nullptr, nullptr, &ctw, &cth);
-        float s = (float)thumb_w / ctw;  // fill-width mode: only check width scale
-        if (s > 1.2f) break;  // would upscale >20% — re-decode at current size
-        cover_textures[cover_load_index] = cached;
-        cover_load_index++;
-      }
-      if (cover_load_index >= (int)cover_textures.size()) break;
-      // Submit next uncached to this worker
-      int i = cover_load_index++;
-      string fpath = sorted_entries[numFolders + i].string();
-      string ext; size_t dot = fpath.find_last_of('.');
-      if (dot != string::npos) ext = fpath.substr(dot);
-      transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-      bool is_pdf = (ext != ".cbz" && ext != ".cbr" && ext != ".cbt" && ext != ".cb7");
-      strncpy(cl[w].job_path, fpath.c_str(), sizeof(cl[w].job_path) - 1);
-      cl[w].job_path[sizeof(cl[w].job_path) - 1] = '\0';
-      cl[w].job_tw = thumb_w; cl[w].job_th = thumb_h;
-      cl[w].job_index = i; cl[w].job_is_pdf = is_pdf;
-      cl_in_flight[w] = i;
-      __atomic_store_n(&cl[w].job_ready, 1, __ATOMIC_RELEASE);
-    }
-
-    // ── Rendering ─────────────────────────────────────────────────────────────
-
-    // Reset clip rect from previous frame before drawing bottom bar
-    SDL_RenderSetClipRect(RENDERER, NULL);
-
-    // Bottom bar (always visible, drawn first so content clips over it)
-    {
-      int exitWidth = 0;
-      TTF_SizeText(ROBOTO_20, "Exit", &exitWidth, NULL);
-      SDL_DrawButtonPrompt(RENDERER, button_b, ROBOTO_20, textColor, "Exit",
-                           windowX - exitWidth - 50, windowY - 10, 35, 35, 5, 0);
-
-      int themeWidth = 0;
-      TTF_SizeText(ROBOTO_20, "Switch Theme", &themeWidth, NULL);
-      SDL_DrawButtonPrompt(RENDERER, button_minus, ROBOTO_20, textColor,
-                           "Switch Theme", windowX - themeWidth - 50,
-                           windowY - 40, 35, 35, 5, 0);
-      SDL_DrawButtonPrompt(RENDERER, button_plus, ROBOTO_20, textColor,
-                           "Options Menu", windowX - themeWidth - 50,
-                           windowY - 70, 35, 35, 5, 0);
-
-      string display_path = path.size() > 18 ? path.substr(18) : "";
-      SDL_DrawText(RENDERER, ROBOTO_25, 10, windowY - 40, textColor,
-                   display_path.c_str());
-    }
-
-    // Clip content area to avoid overflowing into the bottom bar
-    SDL_Rect clip = {0, 0, windowX, windowY - BOTTOM_H};
-    SDL_RenderSetClipRect(RENDERER, &clip);
-
-    // ── Folder list (top of content) ──────────────────────────────────────────
-    for (int i = 0; i < numFolders; i++) {
-      int row_y = i * FOLDER_H - scroll_y;
-      if (row_y + FOLDER_H < 0 || row_y > windowY - BOTTOM_H) continue;
-
-      if (chosen_index == i)
-        SDL_DrawRect(RENDERER, 0, row_y, windowX, FOLDER_H, selectorColor);
-
-      SDL_DrawImageScale(RENDERER, folder_image, 8, row_y + 4, 32, 32);
-      if (sorted_entries[i].string() == RECENT_SENTINEL) {
-        SDL_Color recentColor = {0, 180, 220, 255};
-        SDL_DrawText(RENDERER, ROBOTO_25, 48, row_y + (FOLDER_H - 22) / 2,
-                     recentColor, "Recently Opened");
-      } else {
-        SDL_DrawText(RENDERER, ROBOTO_25, 48, row_y + (FOLDER_H - 22) / 2,
-                     textColor, sorted_entries[i].filename().c_str());
-      }
-    }
-
-    // ── Book / comic grid ─────────────────────────────────────────────────────
-    int numBooks   = amountOfFiles - numFolders;
-    int books_top  = numFolders * FOLDER_H;
-
-    TTF_Font* lf  = pick_label_font();
-    int lf_h      = TTF_FontHeight(lf);
-    int strip_h   = lf_h + 8;  // 4px padding above and below text
-
-    for (int bi = 0; bi < numBooks; bi++) {
-      int row    = bi / cols;
-      int col    = bi % cols;
-      int cell_x = col * cell_w;
-      int cell_y = books_top + row * cell_h - scroll_y;
-
-      if (cell_y + cell_h < 0 || cell_y > windowY - BOTTOM_H) continue;
-
-      // Cover thumbnail or fallback book icon
-      SDL_Texture* cover =
-          (bi < (int)cover_textures.size()) ? cover_textures[bi] : nullptr;
-      int dx = cell_x, dy = cell_y, dw = cell_w, dh = cell_h;
-      if (cover) {
-        // Texture decoded at exact thumb_w × thumb_h — blit 1:1 (or minor scale from cache hit)
-        dw = thumb_w;
-        dh = thumb_h;
-        dx = cell_x + (cell_w - thumb_w) / 2;
-        dy = cell_y;
-        SDL_DrawImageScale(RENDERER, cover, dx, dy, dw, dh);
-      } else {
-        SDL_DrawImageScale(RENDERER, book_image,
-                           cell_x + (cell_w - 40) / 2,
-                           cell_y + (thumb_h - 40) / 2, 40, 40);
-      }
-
-      // Title strip — semi-transparent dark bar overlaid on the cover bottom
-      {
-        string fname = sorted_entries[numFolders + bi].filename().string();
-        size_t dot = fname.find_last_of('.');
-        if (dot != string::npos) fname = fname.substr(0, dot);
-        int limit = dw - 8;
-        string trunc_key = fname + "|" + to_string(limit) + "|" + to_string(lf_h);
-        auto it = trunc_cache.find(trunc_key);
-        int label_w = 0;
-        if (it != trunc_cache.end()) {
-          fname = it->second;
-          TTF_SizeText(lf, fname.c_str(), &label_w, nullptr);
-        } else {
-          TTF_SizeText(lf, fname.c_str(), &label_w, nullptr);
-          if (label_w > limit) {
-            while (!fname.empty()) {
-              fname.pop_back();
-              TTF_SizeText(lf, (fname + "..").c_str(), &label_w, nullptr);
-              if (label_w <= limit) { fname += ".."; break; }
-            }
-          }
-          trunc_cache[trunc_key] = fname;
-        }
-        int strip_y = dy + dh - strip_h;
-        SDL_SetRenderDrawBlendMode(RENDERER, SDL_BLENDMODE_BLEND);
-        SDL_SetRenderDrawColor(RENDERER, 0, 0, 0, 170);
-        SDL_Rect strip_rect = { dx, strip_y, dw, strip_h };
-        SDL_RenderFillRect(RENDERER, &strip_rect);
-        SDL_SetRenderDrawBlendMode(RENDERER, SDL_BLENDMODE_NONE);
-        SDL_DrawText(RENDERER, lf,
-                     dx + (dw - label_w) / 2, strip_y + (strip_h - lf_h) / 2,
-                     WHITE, fname.c_str());
-      }
-
-      // Selection highlight — 3px bright border drawn over cover + strip
-      if (chosen_index == numFolders + bi) {
-        SDL_SetRenderDrawBlendMode(RENDERER, SDL_BLENDMODE_BLEND);
-        SDL_SetRenderDrawColor(RENDERER, 255, 255, 255, 220);
-        for (int t = 0; t < 3; t++) {
-          SDL_Rect border = { cell_x + t, cell_y + t, cell_w - 2*t, cell_h - 2*t };
-          SDL_RenderDrawRect(RENDERER, &border);
-        }
-        SDL_SetRenderDrawBlendMode(RENDERER, SDL_BLENDMODE_NONE);
-      }
-
-      // Warning badge (top-right corner) for unsupported formats
-      string entry_ext = sorted_entries[numFolders + bi].filename().extension().string();
-      if (contains(warnedExtentions, entry_ext))
-        SDL_DrawImageScale(RENDERER, warning, cell_x + cell_w - 28, cell_y + 4, 24, 24);
-
-      // Note badge (top-left corner) — teal dot when a note exists
-      if (chooser_note_exists(sorted_entries[numFolders + bi].string())) {
-        SDL_SetRenderDrawBlendMode(RENDERER, SDL_BLENDMODE_NONE);
-        SDL_SetRenderDrawColor(RENDERER, 0, 150, 136, 255);  // teal
-        SDL_Rect nb = { cell_x + 4, cell_y + 4, 12, 12 };
-        SDL_RenderFillRect(RENDERER, &nb);
-      }
-    }
-
-    // ── Empty folder label ────────────────────────────────────────────────────
-    if (amountOfFiles == 0 && ROBOTO_30) {
-      const char* empty_msg = "This folder is empty";
-      int ew = 0, eh = 0;
-      TTF_SizeText(ROBOTO_30, empty_msg, &ew, &eh);
-      SDL_DrawText(RENDERER, ROBOTO_30, (windowX - ew) / 2, (windowY - eh) / 2,
-                   textColor, empty_msg);
-    }
-
-    SDL_RenderSetClipRect(RENDERER, nullptr);  // clear clip
-
-    // ── Modal overlays ────────────────────────────────────────────────────────
-
-    if (isWarningOnScreen) {
-      if (!configDarkMode)
-        SDL_DrawRect(RENDERER, 0, 0, 1280, 720, SDL_MakeColour(50, 50, 50, 150));
-
-      SDL_DrawRect(RENDERER, (windowX - warningWidth) / 2,
-                   (windowY - warningHeight) / 2, warningWidth, warningHeight,
-                   configDarkMode ? HINT_COLOUR_DARK : HINT_COLOUR_LIGHT);
-      SDL_DrawText(RENDERER, ROBOTO_30,
-                   (windowX - warningWidth) / 2 + 15,
-                   (windowY - warningHeight) / 2 + 15, textColor,
-                   "This file is not yet fully supported, and may");
-      SDL_DrawText(RENDERER, ROBOTO_30,
-                   (windowX - warningWidth) / 2 + 15,
-                   (windowY - warningHeight) / 2 + 50, textColor,
-                   "cause a system, or app crash.");
-      SDL_DrawText(RENDERER, ROBOTO_20,
-                   (windowX - warningWidth) / 2 + warningWidth - 250,
-                   (windowY - warningHeight) / 2 + warningHeight - 30,
-                   textColor, "\"A\" - Read");
-      SDL_DrawText(RENDERER, ROBOTO_20,
-                   (windowX - warningWidth) / 2 + warningWidth - 125,
-                   (windowY - warningHeight) / 2 + warningHeight - 30,
-                   textColor, "\"B\" - Cancel.");
-    }
-
-    if (drawOption) {
-      int helpWidth  = 680;
-      int helpHeight = 395;
-
-      if (!configDarkMode)
-        SDL_DrawRect(RENDERER, 0, 0, 1280, 720, SDL_MakeColour(50, 50, 50, 150));
-
-      SDL_DrawRect(RENDERER, (windowX - helpWidth) / 2,
-                   (windowY - helpHeight) / 2, helpWidth, helpHeight,
-                   configDarkMode ? HINT_COLOUR_DARK : HINT_COLOUR_LIGHT);
-
-      int optTextX = (windowX - helpWidth) / 2 + 20;
-      int optTextY = (windowY - helpHeight) / 2 + 87;
-
-      SDL_DrawRect(
-          RENDERER, optTextX - 20, optTextY + (38 * option_index),
-          helpWidth, 40,
-          configDarkMode ? SELECTOR_COLOUR_DARK : SELECTOR_COLOUR_LIGHT);
-
-      SDL_DrawText(RENDERER, ROBOTO_30, optTextX,
-                   (windowY - helpHeight) / 2 + 10, textColor, "Option Menu");
-
-      SDL_DrawText(RENDERER, ROBOTO_25, optTextX, optTextY, textColor,
-                   "Folder Color: ");
-      SDL_DrawText(RENDERER, ROBOTO_25, optTextX + 400, optTextY, textColor,
-                   colors[chosenFolderColor].c_str());
-
-      SDL_DrawText(RENDERER, ROBOTO_25, optTextX, optTextY + 38, textColor,
-                   "Book Color: ");
-      SDL_DrawText(RENDERER, ROBOTO_25, optTextX + 400, optTextY + 38,
-                   textColor, colors[chosenBookColor].c_str());
-
-      SDL_DrawText(RENDERER, ROBOTO_25, optTextX, optTextY + 38 * 2,
-                   textColor, "Scroll Speed: ");
-      SDL_DrawTextf(RENDERER, ROBOTO_25, optTextX + 400, optTextY + 38 * 2,
-                    textColor, "%d", scroll_option);
-
-      SDL_DrawText(RENDERER, ROBOTO_25, optTextX, optTextY + 38 * 3,
-                   textColor, "Zoom Amount: ");
-      SDL_DrawTextf(RENDERER, ROBOTO_25, optTextX + 400, optTextY + 38 * 3,
-                    textColor, "%d", zoom_option);
-
-      SDL_DrawText(RENDERER, ROBOTO_25, optTextX, optTextY + 38 * 4,
-                   textColor, "Screen Buttons: ");
-      SDL_DrawText(RENDERER, ROBOTO_25, optTextX + 400, optTextY + 38 * 4,
-                   textColor, configScreenButtons ? "On" : "Off");
-
-      SDL_DrawText(RENDERER, ROBOTO_25, optTextX, optTextY + 38 * 5,
-                   textColor, "Status Bar: ");
-      SDL_DrawText(RENDERER, ROBOTO_25, optTextX + 400, optTextY + 38 * 5,
-                   textColor, configStatusBar ? "On" : "Off");
-    }
-
-    // ── Notes overlay ─────────────────────────────────────────────────────────
-    if (drawNotesChooser) {
-      int noteWidth  = 800;
-      int noteHeight = 500;
-
-      if (!configDarkMode)
-        SDL_DrawRect(RENDERER, 0, 0, 1280, 720, SDL_MakeColour(50, 50, 50, 150));
-
-      SDL_DrawRect(RENDERER, (windowX - noteWidth) / 2,
-                   (windowY - noteHeight) / 2, noteWidth, noteHeight,
-                   configDarkMode ? HINT_COLOUR_DARK : HINT_COLOUR_LIGHT);
-
-      int nTextX = (windowX - noteWidth) / 2 + 20;
-      int nTextY = (windowY - noteHeight) / 2 + 10;
-
-      // Title: comic filename (no extension)
-      string noteFname = notesChooserPath.substr(notesChooserPath.find_last_of("/\\") + 1);
-      size_t dot = noteFname.find_last_of('.');
-      if (dot != string::npos) noteFname = noteFname.substr(0, dot);
-      SDL_DrawText(RENDERER, ROBOTO_25, nTextX, nTextY, textColor, noteFname.c_str());
-      SDL_DrawText(RENDERER, ROBOTO_20, nTextX, nTextY + 30, textColor, "Notes:");
-
-      // Hint at bottom
-      int hintY = (windowY + noteHeight) / 2 - 35;
-      if (ROBOTO_15)
-        SDL_DrawText(RENDERER, ROBOTO_15, nTextX, hintY, textColor,
-                     "A = Edit    B / Y = Close");
-
-      // Note body
-      int bodyY    = nTextY + 65;
-      int bodyMaxH = hintY - bodyY - 10;
-      if (notesChooserText.empty()) {
-        if (ROBOTO_25)
-          SDL_DrawText(RENDERER, ROBOTO_25, nTextX, bodyY,
-                       DARK_GRAY, "No notes yet. Press A to add one.");
-      } else if (ROBOTO_20) {
-        SDL_DrawTextWrapped(RENDERER, ROBOTO_20, nTextX, bodyY,
-                            noteWidth - 40, bodyMaxH, textColor,
-                            notesChooserText.c_str());
-      }
-    }
-
-    SDL_RenderPresent(RENDERER);
+    float max_s = std::max(0, content_h - view_h());
+    scroll = std::min(std::max(scroll, 0.0f), max_s);
+
+    pump_covers();
+    draw();
   }
+}
 
-  // Stop all background cover loader threads
-  for (int w = 0; w < N_WORKERS; w++) {
-    __atomic_store_n(&cl[w].should_exit, 1, __ATOMIC_RELEASE);
-    __atomic_store_n(&cl[w].job_ready, 0, __ATOMIC_RELEASE);  // cancel any queued job
-  }
-  for (int w = 0; w < N_WORKERS; w++) {
-    threadWaitForExit(&cl[w].thread);
-    threadClose(&cl[w].thread);
-    if (cl[w].result_pixels) { free(cl[w].result_pixels); cl[w].result_pixels = nullptr; }
-  }
-
-  // Cleanup — cache owns all textures; clear it here before SDL shuts down
-  cover_textures.clear();
-  g_cover_cache.clear();
-
-  if (optionConfig) {
-    config_destroy(optionConfig);
-    free(optionConfig);
-    optionConfig = nullptr;
-  }
+void Menu_StartChoosing() {
+  Chooser *c = new Chooser();
+  c->run();
+  delete c;
 }

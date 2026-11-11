@@ -3,11 +3,12 @@
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
-//#include "SDL_helper.h"
 
 extern SDL_Window *WINDOW;
-//extern SDL_Surface *WINDOW_SURFACE;
 extern SDL_Renderer *RENDERER;
-extern TTF_Font *ROBOTO_35, *ROBOTO_30, *ROBOTO_27, *ROBOTO_25, *ROBOTO_20, *ROBOTO_15;
+
+// UI fonts (Switch system font when available, Roboto fallback).
+extern TTF_Font *FONT_14, *FONT_16, *FONT_18, *FONT_20, *FONT_22, *FONT_25,
+    *FONT_28, *FONT_32, *FONT_40;
 
 #endif

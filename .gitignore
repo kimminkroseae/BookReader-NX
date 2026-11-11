@@ -16,3 +16,10 @@ build/
 # git has its own built in compression methods
 #*.7z
 #*.dmg
+# Build outputs / local-only files
+lib/
+mupdf/generated/
+*.o
+*.d
+*.map
+build-debug/

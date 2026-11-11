@@ -8,8 +8,8 @@
 // Eliminates the create+destroy SDL_Texture cycle that previously happened on
 // every SDL_DrawText / SDL_DrawRotatedText call (~300×/sec in typical use).
 
-#define TEXT_CACHE_MAX 64
-#define TEXT_CACHE_KEY_LEN 128
+#define TEXT_CACHE_MAX 256
+#define TEXT_CACHE_KEY_LEN 192
 
 typedef struct {
     TTF_Font   *font;
@@ -80,7 +80,7 @@ static SDL_Texture *tc_get(SDL_Renderer *renderer, TTF_Font *font,
     }
 
     // Cache miss — create new texture
-    SDL_Surface *surf = TTF_RenderText_Blended_Wrapped(font, text, color, 1280);
+    SDL_Surface *surf = TTF_RenderUTF8_Blended(font, text, color);
     if (!surf) return NULL;
     SDL_SetSurfaceAlphaMod(surf, color.a);
     SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
@@ -230,7 +230,7 @@ void SDL_DrawButtonPrompt(SDL_Renderer *renderer, SDL_Texture *texture, TTF_Font
 
 	int textX = x + imageDistance + imageW;
 	int textY = y - (imageH * 0.85) - yTextOffset; // 0.85 was retreived from trail and error when trying to center the text with the image.
-	SDL_DrawText(RENDERER, ROBOTO_20, textX, textY, textColor, text);
+	SDL_DrawText(RENDERER, font, textX, textY, textColor, text);
 }
 
 void SDL_DrawHorizonalAlignedImageText(SDL_Renderer *renderer, SDL_Texture *texture, TTF_Font *font, SDL_Color textColor, const char *text, int x, int y, int imageW, int imageH, int imageDistance, int yTextOffset)

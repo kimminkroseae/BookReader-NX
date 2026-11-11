@@ -1,126 +1,140 @@
 #ifndef WOOK_READER_PAGE_LAYOUT_HPP
 #define WOOK_READER_PAGE_LAYOUT_HPP
 
-#include <mupdf/pdf.h>
 #include <SDL2/SDL.h>
+#include <mupdf/fitz.h>
 #include <switch.h>
+
+#include <map>
 #include <string>
+
+#include "PageView.hpp"
 
 extern fz_context *ctx;
 
-static inline void FreeTextureIfNeeded(SDL_Texture **texture)
-{
-    if (texture && *texture)
-    {
-        SDL_DestroyTexture(*texture);
-        *texture = NULL;
-    }
+static inline void FreeTextureIfNeeded(SDL_Texture **texture) {
+  if (texture && *texture) {
+    SDL_DestroyTexture(*texture);
+    *texture = NULL;
+  }
 }
 
-// Background rasterization state for MuPDF layouts.
-// The thread uses a cloned context + independently-opened document,
-// so no locking between main thread and background thread is needed.
+// In-place luminance inversion of packed RGB(A) pixels: white paper becomes
+// black, black text becomes white, colours keep their hue.
+void InvertLuminance(unsigned char *px, int w, int h, int stride, int n);
+
+// One background rasterisation slot. Each slot owns a cloned context and an
+// independently opened document, so no locking is needed.
 struct BgRender {
-    Thread        thread;
-    fz_context   *bg_ctx  = nullptr;  // fz_clone_context(ctx)
-    fz_document  *bg_doc  = nullptr;  // fz_open_document(bg_ctx, path)
-    fz_pixmap    *result  = nullptr;  // written by bg thread, read by main after join
-    volatile int  cancel  = 0;        // atomic: 1 = abort
-    volatile int  done    = 0;        // atomic: 1 = thread finished
-    bool          active  = false;
-    int           target_page = -1;
-    float         target_zoom = 1.0f;
-    bool          dark_mode   = false;
+  Thread thread;
+  fz_context *bg_ctx = nullptr;
+  fz_document *bg_doc = nullptr;
+  fz_pixmap *result = nullptr;
+  volatile int cancel = 0;
+  volatile int done = 0;
+  bool active = false;
+  int target_page = -1;
+  float target_zoom = 0;  // <= 0: compute the fit zoom from vw/vh/fit
+  float used_zoom = 0;    // zoom actually rendered at
+  float vw = 0, vh = 0;
+  int fit = 0;
+  bool invert = false;
+  bool doc_failed = false;
+  fz_cookie cookie;  // abort flag for an in-progress render
 };
 
-class PageLayout
-{
-public:
-    PageLayout(fz_document *doc, int current_page);
-    virtual ~PageLayout();
+// Page layout for MuPDF documents (PDF, EPUB, XPS, FB2, HTML, TXT).
+// CBZPageLayout derives from it for image archives.
+class PageLayout {
+ public:
+  PageLayout(fz_document *doc, int current_page, SDL_Rect viewport, int fit, bool invert);
+  virtual ~PageLayout();
 
-    int current_page()
-    {
-        return _current_page;
-    }
+  int current_page() const { return _current_page; }
+  virtual int page_count() const { return pages_count; }
+  virtual bool is_ready() const { return page_texture != nullptr && _tex_page == _current_page; }
+  virtual bool is_spread() const { return false; }
+  virtual int pages_shown() const { return 1; }
 
-    // Call from BookReader after constructing layout to enable background rasterization.
-    void set_bg_path(const char *path);
+  // Enables background rendering + prefetch. Reflow parameters are applied to
+  // the background documents when the document is reflowable.
+  void set_bg_path(const char *path, float reflow_w, float reflow_h, float em);
 
-    // Call from BookReader::draw() each frame (for MuPDF layouts only).
-    // Checks if background render finished and swaps in the new texture.
-    // Also polls prefetch slots.
-    void poll_bg_render();
+  // Per-frame work. Returns true when something visible changed.
+  virtual bool poll();
 
-    virtual void previous_page(int n);
-    virtual void next_page(int n);
-    virtual void goto_page(int num);    // 0-indexed absolute jump
-    virtual void zoom_in(float zoom_amount);
-    virtual void zoom_out(float zoom_amount);
-    virtual void zoom_max();
-    virtual void move_up(int scroll_speed);
-    virtual void move_down(int scroll_speed);
-    virtual void move_left(int scroll_speed);
-    virtual void move_right(int scroll_speed);
-    virtual void reset();
-    virtual void draw_page();
-    virtual char *info();
-    virtual bool pageFitsWidth() const  { return page_bounds.x1 * zoom <= viewport.w + 0.5f; }
-    virtual bool pageFitsHeight() const { return page_bounds.y1 * zoom <= viewport.h + 0.5f; }
+  virtual void next_page(int n);
+  virtual void previous_page(int n);
+  virtual void goto_page(int num);
 
-protected:
-    virtual void render_page_to_texture(int num, bool reset_zoom);
-    virtual void set_zoom(float value);
-    virtual void move_page(float x, float y);
-    virtual void top_of_page();
+  virtual void set_viewport(SDL_Rect vp);
+  virtual void set_fit(int fit);
+  virtual void set_invert(bool invert);
 
-    fz_document *doc = NULL;
-    pdf_document *pdf = NULL;
-    const int pages_count = 0;
+  void zoom_at(float z, float px, float py);  // px/py in viewport coordinates
+  void pan(float dx, float dy);
+  void reset_view(int anchor);
 
-    int _current_page = 0;
-    fz_rect page_bounds = fz_empty_rect;
-    fz_point page_center = fz_make_point(0, 0);
-    float min_zoom = 1, max_zoom = 1, zoom = 1;
+  virtual void draw();
 
-    SDL_Rect viewport;
-    SDL_Texture *page_texture = NULL;
+  PageView &view() { return _view; }
 
-private:
-    std::string _bg_path;
-    BgRender    _bg;       // current-page render (core 3)
-    BgRender    _pf_fwd;   // prefetch N+1        (core 1)
-    BgRender    _pf_bwd;   // prefetch N-1        (core 2)
+ protected:
+  PageLayout();  // for CBZPageLayout (no MuPDF document)
+  virtual void on_zoom_changed() {}
 
-    // Ready (decoded) prefetch textures
-    SDL_Texture *_pf_fwd_tex  = nullptr;
-    SDL_Texture *_pf_bwd_tex  = nullptr;
-    int          _pf_fwd_page = -1;
-    int          _pf_bwd_page = -1;
-    float        _pf_fwd_zoom = -1.0f;
-    float        _pf_bwd_zoom = -1.0f;
+  PageView _view;
+  int _current_page = 0;
+  int pages_count = 0;
+  bool _invert = false;
 
-    // Current-page render
-    void start_bg_render(int page, float z);
-    void cancel_bg_render();
-    static void bg_thread_entry(void *arg);
+ private:
+  void load_current(int anchor);
+  void request_render();
+  void render_sync(float z);
+  float render_zoom() const;
+  void invalidate_prefetch();
 
-    // Shared render implementation (used by all three slots)
-    void do_render_slot(BgRender& slot);
+  fz_document *doc = nullptr;
+  fz_rect page_bounds = fz_empty_rect;
+  SDL_Texture *page_texture = nullptr;
+  int _tex_page = -1;
+  float _tex_zoom = 0;
+  uint32_t _zoom_changed_at = 0;
+  uint32_t _retry_at = 0;
 
-    // Per-slot thread entry points
-    static void pf_fwd_thread_entry(void *arg);
-    static void pf_bwd_thread_entry(void *arg);
+  std::string _bg_path;
+  float _reflow_w = 0, _reflow_h = 0, _reflow_em = 0;
+  BgRender _bg;  // current page
 
-    // Prefetch slot helpers
-    void start_pf_slot(BgRender& slot, int page, float z, void (*entry)(void*), int core);
-    void cancel_pf_slot(BgRender& slot, SDL_Texture **tex, int *page_ref, float *zoom_ref);
-    void poll_pf_slot(BgRender& slot, SDL_Texture **tex, int *page_ref, float *zoom_ref);
-    void start_prefetch();
+  // Workers that render the rest of the book into RAM, nearest pages first.
+  static constexpr int N_PF = 2;
+  BgRender _pf[N_PF];
+  struct RamPix {
+    unsigned char *px;  // packed RGB
+    int w, h;
+    float zoom;
+    size_t bytes;
+  };
+  std::map<int, RamPix> _ram;
+  size_t _ram_bytes = 0;
+  size_t _budget = 0;
+  bool ram_insert(int page, fz_pixmap *pix, float zoom);
+  void ram_clear();
+  int fill_order(int *out, int max) const;
 
-    // Context/document init helper
-    bool init_slot_ctx(BgRender& slot, const char *path);
-    void free_slot_ctx(BgRender& slot);
+  bool init_slot_ctx(BgRender &slot);
+  void free_slot_ctx(BgRender &slot);
+  void do_render_slot(BgRender &slot);
+  static void bg_thread_entry(void *arg);
+  static void pf_thread_entry_0(void *arg);
+  static void pf_thread_entry_1(void *arg);
+  bool start_slot(BgRender &slot, int page, float z, void (*entry)(void *), int core, int prio);
+  void abort_slot(BgRender &slot);
+  void cancel_slot(BgRender &slot);
+  fz_pixmap *reap_pixmap(BgRender &slot);
+  bool slot_params_match(const BgRender &slot) const;
+  void start_prefetch();
 };
 
 #endif

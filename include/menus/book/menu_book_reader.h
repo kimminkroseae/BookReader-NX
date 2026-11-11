@@ -1,8 +1,7 @@
 #ifndef WOOK_READER_MENU_BOOK_READER_H
 #define WOOK_READER_MENU_BOOK_READER_H
 
-#include <switch.h>
-
-void Menu_OpenBook(char *path, int scroll_speed, float zoom_amount);
+// Opens a book/comic/image folder and runs the reader until it is closed.
+void Menu_OpenBook(const char *path);
 
 #endif

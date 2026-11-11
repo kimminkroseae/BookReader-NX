@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #include <archive.h>
 #include <archive_entry.h>
@@ -20,11 +21,14 @@
 
 #include <turbojpeg.h>
 
+#include "memory_mode.h"
+#include "natsort.h"
+#include "paths.h"
+
 extern "C"
 {
 #include <switch/kernel/mutex.h>
 #include "common.h"
-#include "config.h"
 #include "SDL_helper.h"
 }
 
@@ -36,6 +40,16 @@ extern void Log_Error(const std::string &msg);
 // ---------------------------------------------------------------------------
 
 static bool is_image_ext(const char *filename);
+
+// macOS resource-fork junk that looks like images but is not.
+static bool is_page_entry(const char *name)
+{
+    if (!name || !is_image_ext(name)) return false;
+    if (strstr(name, "__MACOSX/")) return false;
+    const char *base = strrchr(name, '/');
+    base = base ? base + 1 : name;
+    return !(base[0] == '.' && base[1] == '_');
+}
 
 // Scan a RAR3 archive's file headers WITHOUT decompression.
 // Jumps between blocks using PACK_SIZE fseek — works for solid and non-solid RAR3.
@@ -94,7 +108,7 @@ static bool enumerate_rar3_headers(const char *path, std::vector<std::string> &o
                         namebuf[name_size] = '\0';
                         for (int i = 0; namebuf[i]; i++)
                             if (namebuf[i] == '\\') namebuf[i] = '/';
-                        if (is_image_ext(namebuf))
+                        if (is_page_entry(namebuf))
                         {
                             out_names.push_back(namebuf);
                             if (out_count)
@@ -124,7 +138,7 @@ static bool is_image_ext(const char *filename)
 
     return strcmp(ext, ".jpg")  == 0 || strcmp(ext, ".jpeg") == 0 ||
            strcmp(ext, ".png")  == 0 || strcmp(ext, ".webp") == 0 ||
-           strcmp(ext, ".gif")  == 0 || strcmp(ext, ".tiff") == 0;
+           strcmp(ext, ".gif")  == 0 || strcmp(ext, ".bmp")  == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,11 +148,11 @@ static bool is_image_ext(const char *filename)
 // re-opening the same comic skips the full archive scan (especially important
 // for large solid RAR (CBR) archives where enumeration decompresses every page).
 //
-// Cache file: /switch/WookReader/.pagecache/<16-hex-digit key>.lst
+// Cache file: <APP_DIR>/.pagecache/<16-hex-digit key>.lst2 (natural sort order)
 // Cache key : FNV-1a hash of (path + file-size + mtime) — invalidates if the
 //             file is replaced or modified.
 
-static const char CACHE_DIR[] = "/switch/WookReader/.pagecache";
+static const char CACHE_DIR[] = PAGECACHE_DIR;
 
 static uint64_t compute_cache_key(const char *path)
 {
@@ -159,7 +173,7 @@ static bool load_page_cache(const char *path, std::vector<std::string> &names)
 {
     uint64_t key = compute_cache_key(path);
     char cache_path[512];
-    snprintf(cache_path, sizeof(cache_path), "%s/%016llx.lst",
+    snprintf(cache_path, sizeof(cache_path), "%s/%016llx.lst2",
              CACHE_DIR, (unsigned long long)key);
     FILE *f = fopen(cache_path, "r");
     if (!f) return false;
@@ -181,7 +195,7 @@ static void save_page_cache(const char *path, const std::vector<std::string> &na
     mkdir(CACHE_DIR, 0755);  // create dir if it doesn't exist (ignores EEXIST)
     uint64_t key = compute_cache_key(path);
     char cache_path[512];
-    snprintf(cache_path, sizeof(cache_path), "%s/%016llx.lst",
+    snprintf(cache_path, sizeof(cache_path), "%s/%016llx.lst2",
              CACHE_DIR, (unsigned long long)key);
     FILE *f = fopen(cache_path, "w");
     if (!f) { Log_Error(std::string("save_page_cache: cannot write ") + cache_path); return; }
@@ -278,7 +292,8 @@ static bool enumerate_images(const char *path, std::vector<std::string> &out_nam
                               std::string *first_name = nullptr,
                               void       **first_data = nullptr,
                               size_t      *first_size = nullptr,
-                              volatile int *out_count = nullptr)
+                              volatile int *out_count = nullptr,
+                              volatile int *cancel = nullptr)
 {
     struct archive *a = archive_read_new();
     archive_read_support_filter_all(a);
@@ -298,6 +313,8 @@ static bool enumerate_images(const char *path, std::vector<std::string> &out_nam
     struct archive_entry *entry;
     while (archive_read_next_header(a, &entry) == ARCHIVE_OK)
     {
+        if (cancel && __atomic_load_n(cancel, __ATOMIC_ACQUIRE))
+            break;
         if (archive_entry_filetype(entry) == AE_IFDIR)
         {
             archive_read_data_skip(a);
@@ -305,7 +322,7 @@ static bool enumerate_images(const char *path, std::vector<std::string> &out_nam
         }
 
         const char *name = archive_entry_pathname(entry);
-        if (name && is_image_ext(name))
+        if (name && is_page_entry(name))
         {
             out_names.push_back(name);
             if (out_count)
@@ -457,16 +474,134 @@ static bool extract_image(const char *path, const std::string &target_name,
 // Wrapper that checks/populates g_raw_cache before calling extract_image.
 // Eliminates archive re-opens for recently-visited pages (back navigation,
 // prefetch thread races, etc.). Caller must SDL_free the returned data.
+// Folder-of-images mode: read <dir>/<name> straight from the SD card.
+static bool read_dir_image(const char *dir, const std::string &name,
+                           void **out_data, size_t *out_size)
+{
+    *out_data = nullptr;
+    *out_size = 0;
+    std::string full = std::string(dir) + "/" + name;
+    FILE *f = fopen(full.c_str(), "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return false; }
+    void *buf = SDL_malloc((size_t)sz);
+    if (!buf) { fclose(f); return false; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) { SDL_free(buf); return false; }
+    *out_data = buf;
+    *out_size = got;
+    return true;
+}
+
+static bool path_is_dir(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+// A libarchive reader that stays open between pages. Reading pages in archive
+// order (the normal case) just continues forward instead of reopening and
+// re-scanning from the start, which matters hugely for solid RAR / 7z.
+struct ArchiveCursor
+{
+    struct archive *a = nullptr;
+    std::string path;
+    ArchiveMem *mem = nullptr;  // whole archive in RAM, once loaded
+    bool on_mem = false;
+
+    ~ArchiveCursor() { close(); }
+    void close()
+    {
+        if (a) archive_read_free(a);
+        a = nullptr;
+    }
+    bool open(const char *p)
+    {
+        close();
+        a = archive_read_new();
+        archive_read_support_filter_all(a);
+        archive_read_support_format_all(a);
+        on_mem = mem && __atomic_load_n(&mem->ready, __ATOMIC_ACQUIRE);
+        int r = on_mem ? archive_read_open_memory(a, mem->buf, mem->size)
+                       : archive_read_open_filename(a, p, 1048576);
+        if (r != ARCHIVE_OK)
+        {
+            close();
+            return false;
+        }
+        path = p;
+        return true;
+    }
+    bool read(const char *p, const std::string &target, void **out, size_t *out_size,
+              volatile int *cancel)
+    {
+        *out = nullptr;
+        *out_size = 0;
+        // Switch to the in-RAM copy as soon as it is available.
+        if (a && !on_mem && mem && __atomic_load_n(&mem->ready, __ATOMIC_ACQUIRE)) close();
+        bool fresh = false;
+        for (int pass = 0; pass < 2; pass++)
+        {
+            if (!a || path != p || pass == 1)
+            {
+                if (!open(p)) return false;
+                fresh = true;
+            }
+            struct archive_entry *e;
+            int r;
+            while ((r = archive_read_next_header(a, &e)) == ARCHIVE_OK)
+            {
+                if (cancel && __atomic_load_n(cancel, __ATOMIC_ACQUIRE)) return false;
+                if (archive_entry_filetype(e) == AE_IFDIR) continue;
+                const char *name = archive_entry_pathname(e);
+                if (!name || target != name) continue;
+                std::vector<uint8_t> buf;
+                la_int64_t sz = archive_entry_size(e);
+                if (sz > 0) buf.reserve((size_t)sz);
+                uint8_t chunk[65536];
+                la_ssize_t n;
+                while ((n = archive_read_data(a, chunk, sizeof(chunk))) > 0)
+                {
+                    if (cancel && __atomic_load_n(cancel, __ATOMIC_ACQUIRE)) return false;
+                    buf.insert(buf.end(), chunk, chunk + n);
+                }
+                if (n < 0 || buf.empty()) { close(); return false; }
+                *out = SDL_malloc(buf.size());
+                if (!*out) return false;
+                memcpy(*out, buf.data(), buf.size());
+                *out_size = buf.size();
+                return true;
+            }
+            if (r != ARCHIVE_EOF) close();  // broken stream: reopen next time
+            if (fresh) break;               // scanned the whole archive already
+        }
+        return false;
+    }
+};
+
 static bool extract_image_cached(const char *archive_path,
                                  const std::string &target_name,
                                  void **out_data, size_t *out_size,
-                                 volatile int *cancel_flag = nullptr)
+                                 volatile int *cancel_flag = nullptr,
+                                 bool is_dir = false,
+                                 ArchiveCursor *cursor = nullptr)
 {
     std::string key = std::string(archive_path) + "|" + target_name;
     if (g_raw_cache.get(key, out_data, out_size))
         return true;
 
-    if (!extract_image(archive_path, target_name, out_data, out_size, cancel_flag))
+    bool ok;
+    if (is_dir)
+        ok = read_dir_image(archive_path, target_name, out_data, out_size);
+    else if (cursor)
+        ok = cursor->read(archive_path, target_name, out_data, out_size, cancel_flag);
+    else
+        ok = extract_image(archive_path, target_name, out_data, out_size, cancel_flag);
+    if (!ok)
         return false;
 
     if (*out_data && *out_size)
@@ -475,1015 +610,849 @@ static bool extract_image_cached(const char *archive_path,
     return true;
 }
 
-// Decode JPEG using libjpeg-turbo (2-3x faster than stb_image, ARM NEON SIMD).
-// Returns heap-allocated RGBA pixels (caller must free()), or nullptr on failure.
+// ---------------------------------------------------------------------------
+// Decoding
+// ---------------------------------------------------------------------------
+
+// libjpeg-turbo: 2-3x faster than stb_image on the Switch's Cortex-A57.
 static unsigned char *decode_jpeg_turbo(const void *data, size_t dsize, int *out_w, int *out_h)
 {
     tjhandle tj = tjInitDecompress();
     if (!tj) return nullptr;
-
     int w = 0, h = 0, subsamp = 0, cs = 0;
     if (tjDecompressHeader3(tj, (const unsigned char *)data, (unsigned long)dsize,
                             &w, &h, &subsamp, &cs) != 0)
     {
-        Log_Error(std::string("decode_jpeg_turbo: header failed: ") + tjGetErrorStr2(tj));
         tjDestroy(tj);
         return nullptr;
     }
-
-    unsigned char *pixels = (unsigned char *)malloc(w * h * 4);
+    unsigned char *pixels = (unsigned char *)malloc((size_t)w * h * 4);
     if (!pixels) { tjDestroy(tj); return nullptr; }
-
     if (tjDecompress2(tj, (const unsigned char *)data, (unsigned long)dsize,
                       pixels, w, 0, h, TJPF_RGBA, TJFLAG_FASTDCT) != 0)
     {
-        Log_Error(std::string("decode_jpeg_turbo: decompress failed: ") + tjGetErrorStr2(tj));
         free(pixels);
         tjDestroy(tj);
         return nullptr;
     }
-
     tjDestroy(tj);
     *out_w = w;
     *out_h = h;
     return pixels;
 }
 
-// Decode image data to an SDL_Surface.
-// For JPEG (FF D8): uses libjpeg-turbo; sets *out_pixels (caller must free()).
-// For other formats: uses SDL2_image; *out_pixels is set to nullptr.
-// Returns nullptr on failure.
-static SDL_Surface *decode_to_surface(void *data, size_t dsize, unsigned char **out_pixels)
+// Decodes any supported image into a malloc'd RGBA buffer (caller free()s).
+// Thread-safe: no renderer access.
+static unsigned char *decode_rgba(const void *data, size_t size, int *w, int *h)
 {
-    *out_pixels = nullptr;
-
-    bool is_jpeg = (dsize >= 2 &&
-                    ((const uint8_t *)data)[0] == 0xFF &&
-                    ((const uint8_t *)data)[1] == 0xD8);
-
-    if (is_jpeg)
+    const uint8_t *d = (const uint8_t *)data;
+    if (size >= 2 && d[0] == 0xFF && d[1] == 0xD8)
     {
-        int w = 0, h = 0;
-        unsigned char *pixels = decode_jpeg_turbo(data, dsize, &w, &h);
-        if (!pixels)
-        {
-            // Fallback: stb_image handles progressive JPEG that turbo may reject
-            int ch = 0;
-            pixels = stbi_load_from_memory(
-                (const stbi_uc *)data, (int)dsize, &w, &h, &ch, 4);
-            if (!pixels) return nullptr;
-        }
-
-        // Masks for RGBA byte-order on little-endian (AArch64)
-        SDL_Surface *s = SDL_CreateRGBSurfaceFrom(
-            pixels, w, h, 32, w * 4,
-            0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
-        if (!s)
-        {
-            Log_Error(std::string("decode_to_surface: SDL_CreateRGBSurfaceFrom failed: ") +
-                      SDL_GetError());
-            free(pixels);
-            return nullptr;
-        }
-        *out_pixels = pixels;
-        return s;
+        unsigned char *px = decode_jpeg_turbo(data, size, w, h);
+        if (px) return px;
     }
+    int ch = 0;
+    unsigned char *px = stbi_load_from_memory(d, (int)size, w, h, &ch, 4);
+    if (px) return px;
 
-    // Non-JPEG: use SDL2_image
-    SDL_RWops *rw = SDL_RWFromMem(data, (int)dsize);
+    // WebP and anything else SDL_image understands.
+    SDL_RWops *rw = SDL_RWFromConstMem(data, (int)size);
     if (!rw) return nullptr;
     SDL_Surface *s = IMG_Load_RW(rw, 1);
-    if (!s)
-        Log_Error(std::string("decode_to_surface: IMG_Load_RW failed: ") + IMG_GetError());
-    return s;
+    if (!s) return nullptr;
+    SDL_Surface *c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGBA32, 0);
+    SDL_FreeSurface(s);
+    if (!c) return nullptr;
+    px = (unsigned char *)malloc((size_t)c->w * c->h * 4);
+    if (px)
+    {
+        for (int y = 0; y < c->h; y++)
+            memcpy(px + (size_t)y * c->w * 4, (uint8_t *)c->pixels + (size_t)y * c->pitch,
+                   (size_t)c->w * 4);
+        *w = c->w;
+        *h = c->h;
+    }
+    SDL_FreeSurface(c);
+    return px;
 }
 
-// ---------------------------------------------------------------------------
-// Early first-page display
-// ---------------------------------------------------------------------------
-
-// Decode _first_image_raw → SDL_Texture and set _valid = true so BookReader::draw()
-// can render the cover immediately while the background enumeration scan continues.
-// Called from the main thread once is_first_image_ready() returns true.
-void CBZPageLayout::apply_first_image()
+// Uploads RGBA pixels; very tall pages (webtoons) are scaled to fit the GPU limit.
+static SDL_Texture *rgba_to_texture(unsigned char *px, int w, int h)
 {
-    if (!_first_image_raw || !_first_image_size) return;
-
-    unsigned char *px   = nullptr;
-    SDL_Surface   *surf = decode_to_surface(_first_image_raw, _first_image_size, &px);
-    SDL_free(_first_image_raw);
-    _first_image_raw  = nullptr;
-    _first_image_size = 0;
-    if (!surf) return;
-
-    SDL_RenderGetViewport(RENDERER, &_viewport);
-    _tex_w   = surf->w;
-    _tex_h   = surf->h;
-    _tex_r_w = 0;
-    _tex     = SDL_CreateTextureFromSurface(RENDERER, surf);
-    SDL_FreeSurface(surf);
-    if (px) free(px);
-    if (!_tex) return;
-
-    // Zoom / centre — same logic as load_page_texture with reset_zoom = true.
-    float ew    = (float)_tex_w;
-    float eh    = (float)_tex_h;
-    _min_zoom   = std::min((float)_viewport.w / ew, (float)_viewport.h / eh);
-    _max_zoom   = std::max((float)_viewport.w / ew, (float)_viewport.h / eh) * 2.0f;
-    _max_zoom   = std::max(_max_zoom, _min_zoom * 4.0f);
-    _zoom       = _min_zoom;
-    _cx         = _viewport.w / 2.0f;
-    _cy         = eh * _zoom / 2.0f;
-    _current_page = 0;
-    _page_count   = 1;   // placeholder until finish_enumeration() knows the real count
-    _valid        = true;
+    static int max_tex = 0;
+    if (!max_tex)
+    {
+        SDL_RendererInfo info;
+        max_tex = (SDL_GetRendererInfo(RENDERER, &info) == 0 && info.max_texture_height > 0)
+                      ? std::min(info.max_texture_width, info.max_texture_height) : 8192;
+    }
+    SDL_Surface *s = SDL_CreateRGBSurfaceFrom(px, w, h, 32, w * 4,
+                                              0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
+    if (!s) return nullptr;
+    SDL_Texture *t = nullptr;
+    if (w > max_tex || h > max_tex)
+    {
+        float sc = (float)max_tex / (float)std::max(w, h);
+        SDL_Surface *d = SDL_CreateRGBSurfaceWithFormat(0, std::max(1, (int)(w * sc)),
+                                                        std::max(1, (int)(h * sc)), 32,
+                                                        SDL_PIXELFORMAT_RGBA32);
+        if (d)
+        {
+            SDL_BlitScaled(s, nullptr, d, nullptr);
+            t = SDL_CreateTextureFromSurface(RENDERER, d);
+            SDL_FreeSurface(d);
+        }
+    }
+    else
+    {
+        t = SDL_CreateTextureFromSurface(RENDERER, s);
+    }
+    SDL_FreeSurface(s);
+    return t;
 }
 
+
 // ---------------------------------------------------------------------------
-// Constructor / Destructor
+// Enumeration
 // ---------------------------------------------------------------------------
 
-// Background enumeration thread entry
 void CBZPageLayout::enum_thread_entry(void *arg)
 {
-    static_cast<CBZPageLayout*>(arg)->do_enumerate();
+    static_cast<CBZPageLayout *>(arg)->do_enumerate();
 }
 
 void CBZPageLayout::do_enumerate()
 {
-    // Fast path: page names already cached on disk from a previous open.
-    // Cache stores names in sorted order, so no sort needed.
-    if (load_page_cache(_archive_path.c_str(), _page_names)) {
-        __atomic_store_n(&_enum_count, (int)_page_names.size(), __ATOMIC_RELEASE);
-        // Pre-extract page 0's raw bytes so the main thread can display the
-        // cover immediately while we signal enum_done.
-        if (!_page_names.empty()) {
-            void *fd = nullptr; size_t fs = 0;
-            if (extract_image_cached(_archive_path.c_str(), _page_names[0], &fd, &fs)) {
-                _first_image_raw  = fd;
-                _first_image_size = fs;
-                _first_image_name = _page_names[0];
-                __atomic_store_n(&_first_image_ready, 1, __ATOMIC_RELEASE);
-            }
+    std::vector<std::string> &names = _enum_names;
+    auto publish_first = [&](void) {
+        if (names.empty()) return;
+        void *fd = nullptr;
+        size_t fs = 0;
+        if (extract_image_cached(_archive_path.c_str(), names[0], &fd, &fs, &_enum_cancel, _is_dir))
+        {
+            _first_image_raw = fd;
+            _first_image_size = fs;
+            _first_image_name = names[0];
+            __atomic_store_n(&_first_image_ready, 1, __ATOMIC_RELEASE);
         }
-        __atomic_store_n(&_enum_done, 1, __ATOMIC_RELEASE);
-        return;
-    }
-    // RAR3 fast path: read file headers directly via fseek — zero decompression.
-    // Completes in ~50ms even for 500MB solid-RAR archives.
-    if (enumerate_rar3_headers(_archive_path.c_str(), _page_names, &_enum_count))
-    {
-        std::sort(_page_names.begin(), _page_names.end());
-        __atomic_store_n(&_enum_count, (int)_page_names.size(), __ATOMIC_RELEASE);
-        // Pre-extract cover so it displays immediately
-        if (!_page_names.empty()) {
-            void *fd = nullptr; size_t fs = 0;
-            if (extract_image_cached(_archive_path.c_str(), _page_names[0], &fd, &fs)) {
-                _first_image_raw  = fd;
-                _first_image_size = fs;
-                _first_image_name = _page_names[0];
-                __atomic_store_n(&_first_image_ready, 1, __ATOMIC_RELEASE);
-            }
-        }
-        save_page_cache(_archive_path.c_str(), _page_names);
-        __atomic_store_n(&_enum_done, 1, __ATOMIC_RELEASE);
-        return;
-    }
+    };
 
-    // Slow path: scan the archive via libarchive (needed for CBZ/CBT/CB7/RAR5).
-    // Pass first-image output params so we can display the cover before the
-    // scan finishes — no extra decompression cost; we save what we'd skip anyway.
-    void *fd = nullptr; size_t fs = 0;
-    enumerate_images(_archive_path.c_str(), _page_names,
-                     &_first_image_name, &fd, &fs,
-                     &_enum_count);
-    if (fd) {
-        _first_image_raw  = fd;
-        _first_image_size = fs;
-        __atomic_store_n(&_first_image_ready, 1, __ATOMIC_RELEASE);
+    if (_is_dir)
+    {
+        DIR *d = opendir(_archive_path.c_str());
+        if (d)
+        {
+            while (struct dirent *e = readdir(d))
+                if (e->d_type != DT_DIR && is_page_entry(e->d_name))
+                    names.push_back(e->d_name);
+            closedir(d);
+        }
+        std::sort(names.begin(), names.end(), NaturalLess());
+        __atomic_store_n(&_enum_count, (int)names.size(), __ATOMIC_RELEASE);
+        publish_first();
     }
-    std::sort(_page_names.begin(), _page_names.end());
-    // Persist names for instant reopen next time.
-    save_page_cache(_archive_path.c_str(), _page_names);
+    else if (load_page_cache(_archive_path.c_str(), names))
+    {
+        __atomic_store_n(&_enum_count, (int)names.size(), __ATOMIC_RELEASE);
+        publish_first();
+    }
+    else if (enumerate_rar3_headers(_archive_path.c_str(), names, &_enum_count))
+    {
+        // RAR3: header-only scan, no decompression.
+        std::sort(names.begin(), names.end(), NaturalLess());
+        __atomic_store_n(&_enum_count, (int)names.size(), __ATOMIC_RELEASE);
+        publish_first();
+        save_page_cache(_archive_path.c_str(), names);
+    }
+    else
+    {
+        // Generic libarchive scan; grabs the first image's bytes on the way.
+        void *fd = nullptr;
+        size_t fs = 0;
+        enumerate_images(_archive_path.c_str(), names, &_first_image_name, &fd, &fs,
+                         &_enum_count, &_enum_cancel);
+        if (fd)
+        {
+            _first_image_raw = fd;
+            _first_image_size = fs;
+            __atomic_store_n(&_first_image_ready, 1, __ATOMIC_RELEASE);
+        }
+        std::sort(names.begin(), names.end(), NaturalLess());
+        if (!__atomic_load_n(&_enum_cancel, __ATOMIC_ACQUIRE))
+            save_page_cache(_archive_path.c_str(), names);
+    }
     __atomic_store_n(&_enum_done, 1, __ATOMIC_RELEASE);
+}
+
+void CBZPageLayout::apply_first_image()
+{
+    if (!_first_image_raw || !_first_image_size) return;
+    int w = 0, h = 0;
+    unsigned char *px = decode_rgba(_first_image_raw, _first_image_size, &w, &h);
+    SDL_free(_first_image_raw);
+    _first_image_raw = nullptr;
+    _first_image_size = 0;
+    if (!px) return;
+    if (_invert) InvertLuminance(px, w, h, w * 4, 4);
+    _tex = rgba_to_texture(px, w, h);
+    free(px);
+    if (!_tex) return;
+    _tex_w = _tex_cur_w = w;
+    _tex_h = h;
+    _current_page = 0;
+    apply_dims(ANCHOR_TOP);
+    _valid = true;
 }
 
 void CBZPageLayout::finish_enumeration()
 {
     if (!_enumerating) return;
-
-    // Wait for the enumeration thread to finish (non-blocking: caller checks is_enumerating() first)
-    threadWaitForExit(&_enum_thread);
-    threadClose(&_enum_thread);
-    _enumerating = false;
-
-    if (_page_names.empty())
+    if (_enum_threaded)
     {
-        Log_Error(std::string("CBZPageLayout: no image files found in archive: ") + _archive_path);
-        return;  // _valid stays false
+        threadWaitForExit(&_enum_thread);
+        threadClose(&_enum_thread);
     }
-
+    _enumerating = false;
+    _page_names = std::move(_enum_names);
+    _enum_names.clear();
     _page_count = (int)_page_names.size();
-    Log_Write("CBZPageLayout: opened OK, pages=" + std::to_string(_page_count) + " path=" + _archive_path);
 
-    // If user navigated during enumeration, find their page in the now-sorted list.
-    if (!_enum_current_name.empty())
+    if (_page_count == 0)
     {
-        auto it = std::lower_bound(_page_names.begin(), _page_names.end(), _enum_current_name);
-        if (it != _page_names.end() && *it == _enum_current_name)
-            _current_page = (int)(it - _page_names.begin());
-        else
-            _current_page = 0;  // fallback: page name disappeared (shouldn't happen)
-        _enum_current_name.clear();
-        // Restart prefetch with corrected indices
-        int fwd  = (_current_page + 1 < _page_count) ? _current_page + 1 : -1;
-        int bwd  = (_current_page - 1 >= 0)           ? _current_page - 1 : -1;
-        int fwd2 = (_current_page + 2 < _page_count)  ? _current_page + 2 : -1;
-        start_prefetch(fwd, bwd, fwd2);
+        Log_Error("CBZPageLayout: no images in " + _archive_path);
+        FreeTextureIfNeeded(&_tex);
+        _valid = false;
+        return;
+    }
+    Log_Write("CBZPageLayout: pages=" + std::to_string(_page_count) + " path=" + _archive_path);
+
+    int start = std::max(0, std::min(_start_page, _page_count - 1));
+    bool cover_on_screen = _valid && _tex && start == 0 && !_spread_mode &&
+                           _first_image_name == _page_names[0];
+    if (_first_image_raw) { SDL_free(_first_image_raw); _first_image_raw = nullptr; }
+    if (cover_on_screen)
+    {
+        _current_page = 0;
+        pf_schedule();
     }
     else
     {
-        SDL_RenderGetViewport(RENDERER, &_viewport);
-
-        // If we already displayed the first image early, avoid reloading it.
-        if (_valid && _start_page == 0 &&
-            !_first_image_name.empty() && !_page_names.empty() &&
-            _first_image_name == _page_names[0])
-        {
-            // Correct page already on screen — just unlock navigation.
-            int fwd  = _page_count > 1 ? 1 : -1;
-            int fwd2 = _page_count > 2 ? 2 : -1;
-            start_prefetch(fwd, -1, fwd2);
-        }
-        else
-        {
-            FreeTextureIfNeeded(&_tex);
-            FreeTextureIfNeeded(&_tex_r);
-            int clamped = std::max(0, std::min(_start_page, _page_count - 1));
-            load_page_texture(clamped, true);
-            _valid = true;
-        }
+        _valid = true;  // load_page_texture/prefetch need a valid layout
+        FreeTextureIfNeeded(&_tex);
+        _current_page = -1;
+        load_page_texture(start, ANCHOR_TOP);
+        _valid = _tex != nullptr;
     }
 }
 
-CBZPageLayout::CBZPageLayout(const char *path, int start_page)
-    : PageLayout(nullptr, 0)
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+
+CBZPageLayout::CBZPageLayout(const char *path, int start_page, SDL_Rect vp, int fit,
+                             bool invert, bool spread, bool rtl)
+    : PageLayout()
 {
     _archive_path = path;
-    _start_page   = start_page;
-    _page_names.reserve(8192);  // prevent reallocation during progressive nav
-
-    SDL_RenderGetViewport(RENDERER, &_viewport);
-
-    // Start enumeration on core 2 (core 3 is system-reserved on some Switch firmwares)
-    if (threadCreate(&_enum_thread, enum_thread_entry, this, nullptr, 0x40000, 0x30, 2) == 0 &&
-        threadStart(&_enum_thread) == 0)
+    while (_archive_path.size() > 1 && _archive_path.back() == '/') _archive_path.pop_back();
+    _is_dir = path_is_dir(_archive_path.c_str());
+    _start_page = start_page;
+    _invert = invert;
+    _spread_mode = spread;
+    _rtl = rtl;
+    _view.fit = fit;
+    _view.set_viewport(vp.x, vp.y, vp.w, vp.h);
+    _budget = App_CacheBudget();
+    _main_cursor = new ArchiveCursor();
+    _main_cursor->mem = &_mem;
+    for (int i = 0; i < N_PF; i++)
     {
-        _enumerating = true;
-        // _valid stays false until finish_enumeration() is called from BookReader::draw()
-        return;
+        _pf[i].cursor = new ArchiveCursor();
+        _pf[i].cursor->mem = &_mem;
     }
 
-    // Fallback: synchronous enumeration if thread creation fails
-    if (!enumerate_images(path, _page_names))
-        return;
-
-    if (_page_names.empty())
+    // Copy the whole archive into RAM in the background (lowest priority).
+    if (!_is_dir &&
+        R_SUCCEEDED(threadCreate(&_mem_thread, mem_thread_entry, this, nullptr, 0x10000, 0x3B, 2)))
     {
-        Log_Error(std::string("CBZPageLayout: no image files found in archive: ") + path);
-        return;
+        if (R_SUCCEEDED(threadStart(&_mem_thread)))
+            _mem_threaded = true;
+        else
+            threadClose(&_mem_thread);
     }
 
-    std::sort(_page_names.begin(), _page_names.end());
-    _page_count = (int)_page_names.size();
-
-    Log_Write("CBZPageLayout: opened OK (sync), pages=" + std::to_string(_page_count) + " path=" + path);
-
-    int clamped = std::max(0, std::min(start_page, _page_count - 1));
-    load_page_texture(clamped, true);
-    _valid = true;
+    _enumerating = true;
+    if (R_SUCCEEDED(threadCreate(&_enum_thread, enum_thread_entry, this, nullptr, 0x40000, 0x30, 2)))
+    {
+        if (R_SUCCEEDED(threadStart(&_enum_thread)))
+        {
+            _enum_threaded = true;
+            return;
+        }
+        threadClose(&_enum_thread);
+    }
+    // Fallback: enumerate synchronously.
+    do_enumerate();
+    finish_enumeration();
 }
 
 CBZPageLayout::~CBZPageLayout()
 {
-    // If enumeration thread is still running, wait for it before destruction
-    if (_enumerating)
+    if (_mem_threaded)
     {
+        __atomic_store_n(&_mem_cancel, 1, __ATOMIC_RELEASE);
+        threadWaitForExit(&_mem_thread);
+        threadClose(&_mem_thread);
+        _mem_threaded = false;
+    }
+    if (_enumerating && _enum_threaded)
+    {
+        __atomic_store_n(&_enum_cancel, 1, __ATOMIC_RELEASE);
         threadWaitForExit(&_enum_thread);
         threadClose(&_enum_thread);
         _enumerating = false;
     }
     if (_first_image_raw) { SDL_free(_first_image_raw); _first_image_raw = nullptr; }
     cancel_prefetch();
-    free_ready_textures();
+    // Cursors may read from the in-RAM archive: close them before freeing it.
+    for (int i = 0; i < N_PF; i++) { delete _pf[i].cursor; _pf[i].cursor = nullptr; }
+    delete _main_cursor;
+    _main_cursor = nullptr;
+    ram_clear();
+    free(_mem.buf);
+    _mem.buf = nullptr;
     FreeTextureIfNeeded(&_tex);
     FreeTextureIfNeeded(&_tex_r);
 }
 
-// ---------------------------------------------------------------------------
-// Internal rendering
-// ---------------------------------------------------------------------------
+void CBZPageLayout::mem_thread_entry(void *arg) { static_cast<CBZPageLayout *>(arg)->do_load_mem(); }
 
-// Helper: decode one archive page into an SDL_Texture, freeing all intermediate
-// allocations immediately so we never hold more than one decoded image at a time.
-static SDL_Texture *load_one_page_texture(const char *archive_path,
-                                          const std::string &name,
-                                          int *out_w, int *out_h)
+void CBZPageLayout::do_load_mem()
 {
-    void *data = nullptr;
-    size_t dsize = 0;
-    if (!extract_image_cached(archive_path, name, &data, &dsize))
-        return nullptr;
-
-    unsigned char *pixels = nullptr;
-    SDL_Surface *surf = decode_to_surface(data, dsize, &pixels);
-    SDL_free(data);   // free compressed data immediately
-
-    if (!surf)
-        return nullptr;
-
-    *out_w = surf->w;
-    *out_h = surf->h;
-    SDL_Texture *tex = SDL_CreateTextureFromSurface(RENDERER, surf);
-    SDL_FreeSurface(surf);
-    if (pixels) free(pixels);  // free decoded pixel buffer
-
-    if (!tex)
-        Log_Error(std::string("load_one_page_texture: SDL_CreateTextureFromSurface failed: ") +
-                  SDL_GetError());
-    return tex;
-}
-
-void CBZPageLayout::load_page_texture(int page_num, bool reset_zoom)
-{
-    FreeTextureIfNeeded(&_tex);
-    FreeTextureIfNeeded(&_tex_r);
-
+    struct stat st;
+    if (stat(_archive_path.c_str(), &st) != 0 || st.st_size <= 0) return;
+    size_t size = (size_t)st.st_size;
+    // Only when it leaves at least half of the budget for decoded pages.
+    if (size > _budget / 2 || size > (1ull << 30)) return;
+    unsigned char *buf = (unsigned char *)malloc(size);
+    if (!buf) return;
+    FILE *f = fopen(_archive_path.c_str(), "rb");
+    if (!f) { free(buf); return; }
+    size_t got = 0;
+    while (got < size)
     {
-        int limit = _enumerating ? __atomic_load_n(&_enum_count, __ATOMIC_ACQUIRE) : _page_count;
-        if (limit <= 0) return;
-        _current_page = std::max(0, std::min(page_num, limit - 1));
+        if (__atomic_load_n(&_mem_cancel, __ATOMIC_ACQUIRE)) break;
+        size_t want = std::min<size_t>(4u << 20, size - got);
+        size_t n = fread(buf + got, 1, want, f);
+        if (n == 0) break;
+        got += n;
     }
-
-    int effective_count = _enumerating ? __atomic_load_n(&_enum_count, __ATOMIC_ACQUIRE) : _page_count;
-    bool do_spread = (_spread_mode && _current_page + 1 < effective_count);
-
-    int w = 0, h = 0;
-
-    // Check all prefetch slots for a match
-    {
-        int match = -1;
-        if (!do_spread)
-        {
-            for (int i = 0; i < N_PF; i++)
-            {
-                if (_pf_active[i] && _pf_page[i] == _current_page)
-                {
-                    match = i;
-                    break;
-                }
-            }
-        }
-
-        if (match >= 0)
-        {
-            // Signal all OTHER slots to cancel immediately (non-blocking).
-            // Cleanup is deferred to start_prefetch which runs after we display
-            // the page — by then the losers have had extra time to abort.
-            for (int i = 0; i < N_PF; i++)
-                if (i != match && _pf_active[i])
-                    __atomic_store_n(&_pf_cancel[i], 1, __ATOMIC_RELEASE);
-
-            // Wait for the winning slot — instant if it already finished.
-            threadWaitForExit(&_pf_thread[match]);
-            threadClose(&_pf_thread[match]);
-            _pf_active[match] = false;
-
-            if (_pf_ok[match] && _pf_pixels[match])
-            {
-                SDL_Surface *s = SDL_CreateRGBSurfaceFrom(
-                    _pf_pixels[match], _pf_w[match], _pf_h[match], 32,
-                    _pf_w[match] * 4,
-                    0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
-                if (s)
-                {
-                    w = _pf_w[match];
-                    h = _pf_h[match];
-                    _tex = SDL_CreateTextureFromSurface(RENDERER, s);
-                    SDL_FreeSurface(s);
-                }
-            }
-            if (_pf_pixels[match]) { free(_pf_pixels[match]); _pf_pixels[match] = nullptr; }
-            // Loser slots still flagged _pf_active — start_prefetch will wait and clean them up.
-        }
-        else
-        {
-            // No hit: signal all slots to cancel now so they abort as fast as possible.
-            // start_prefetch (called below) will wait for them to exit and clean up.
-            for (int i = 0; i < N_PF; i++)
-                if (_pf_active[i])
-                    __atomic_store_n(&_pf_cancel[i], 1, __ATOMIC_RELEASE);
-        }
-    }
-
-    if (!_tex)
-    {
-        _tex = load_one_page_texture(_archive_path.c_str(), _page_names[_current_page], &w, &h);
-    }
-
-    if (!_tex)
-    {
-        Log_Error("CBZPageLayout: failed to load page " + std::to_string(_current_page));
-        return;
-    }
-
-    if (do_spread)
-    {
-        int rw = 0, rh = 0;
-        _tex_r = load_one_page_texture(_archive_path.c_str(),
-                                       _page_names[_current_page + 1], &rw, &rh);
-        if (_tex_r)
-        {
-            _tex_r_w = rw;
-            _tex_w   = w + rw;
-            _tex_h   = std::max(h, rh);
-        }
-        else
-        {
-            Log_Error("CBZPageLayout: right page failed, showing single");
-            _tex_r_w = 0;
-            _tex_w   = w;
-            _tex_h   = h;
-        }
-    }
-    else
-    {
-        _tex_r_w = 0;
-        _tex_w   = w;
-        _tex_h   = h;
-    }
-
-    if (reset_zoom)
-    {
-        float eff_w = (_rotation == 90) ? (float)_tex_h : (float)_tex_w;
-        float eff_h = (_rotation == 90) ? (float)_tex_w : (float)_tex_h;
-        _min_zoom = std::min((float)_viewport.w / eff_w,
-                             (float)_viewport.h / eff_h);
-        _max_zoom = std::max((float)_viewport.w / eff_w,
-                             (float)_viewport.h / eff_h) * 2.0f;
-        _max_zoom = std::max(_max_zoom, _min_zoom * 4.0f);
-        _zoom = _min_zoom;
-        _cx   = _viewport.w / 2.0f;
-        _cy   = eff_h * _zoom / 2.0f;
-    }
-
-    // Start async prefetch: N+1 (slot 0/core 1), N-1 (slot 1/core 2), N+2 (slot 2/core 3)
-    if (!do_spread)
-    {
-        int pf_limit = _enumerating ? __atomic_load_n(&_enum_count, __ATOMIC_ACQUIRE) : _page_count;
-        int fwd  = (_current_page + 1 < pf_limit) ? _current_page + 1 : -1;
-        int bwd  = (_current_page - 1 >= 0)        ? _current_page - 1 : -1;
-        int fwd2 = (_current_page + 2 < pf_limit)  ? _current_page + 2 : -1;
-        start_prefetch(fwd, bwd, fwd2);
-    }
+    fclose(f);
+    if (got != size) { free(buf); return; }
+    _mem.buf = buf;
+    _mem.size = size;
+    __atomic_store_n(&_mem.ready, 1, __ATOMIC_RELEASE);
 }
 
 // ---------------------------------------------------------------------------
-// Async prefetch (two parallel threads on cores 1 and 2)
+// Page loading
 // ---------------------------------------------------------------------------
 
-void CBZPageLayout::prefetch_entry_0(void *arg) { ((CBZPageLayout *)arg)->do_prefetch(0); }
-void CBZPageLayout::prefetch_entry_1(void *arg) { ((CBZPageLayout *)arg)->do_prefetch(1); }
-void CBZPageLayout::prefetch_entry_2(void *arg) { ((CBZPageLayout *)arg)->do_prefetch(2); }
-
-void CBZPageLayout::do_prefetch(int slot)
+int CBZPageLayout::page_count() const
 {
-    int page = _pf_page[slot];
-    if (page < 0) return;
+    return _enumerating ? __atomic_load_n(&_enum_count, __ATOMIC_ACQUIRE) : _page_count;
+}
 
-    if (__atomic_load_n(&_pf_cancel[slot], __ATOMIC_ACQUIRE))
-        return;
+int CBZPageLayout::nav_limit() const { return _enumerating ? 0 : _page_count; }
 
+void CBZPageLayout::apply_dims(int anchor)
+{
+    _view.set_content((float)_tex_w, (float)_tex_h);
+    _view.reset(anchor);
+}
+
+// ── RAM page cache ───────────────────────────────────────────────────────────
+
+size_t CBZPageLayout::page_budget() const
+{
+    size_t archive = __atomic_load_n(&_mem.ready, __ATOMIC_ACQUIRE) ? _mem.size : 0;
+    return _budget > archive ? _budget - archive : 0;
+}
+
+// Pages to have decoded, nearest first with a forward bias: +1 +2 -1 +3 +4 -2 ...
+int CBZPageLayout::fill_order(int *out, int max) const
+{
+    if (_enumerating || !_valid) return 0;
+    int n = 0, f = _current_page + 1, b = _current_page - 1;
+    while (n < max && (f < _page_count || b >= 0))
+    {
+        for (int k = 0; k < 2 && n < max && f < _page_count; k++) out[n++] = f++;
+        if (n < max && b >= 0) out[n++] = b--;
+    }
+    return n;
+}
+
+static int page_dist(int a, int b) { return a > b ? a - b : b - a; }
+
+bool CBZPageLayout::ram_insert(int page, unsigned char *px, int w, int h)
+{
+    if (_ram.count(page)) { free(px); return true; }
+    size_t bytes = (size_t)w * h * 4;
+    int d = page_dist(page, _current_page);
+    while (_ram_bytes + bytes > page_budget())
+    {
+        auto far = _ram.end();
+        for (auto it = _ram.begin(); it != _ram.end(); ++it)
+            if (far == _ram.end() || page_dist(it->first, _current_page) > page_dist(far->first, _current_page))
+                far = it;
+        if (far == _ram.end() || page_dist(far->first, _current_page) <= d) { free(px); return false; }
+        _ram_bytes -= far->second.bytes;
+        free(far->second.px);
+        _ram.erase(far);
+    }
+    _ram[page] = {px, w, h, bytes};
+    _ram_bytes += bytes;
+    return true;
+}
+
+void CBZPageLayout::ram_prune()
+{
+    while (_ram_bytes > page_budget() && !_ram.empty())
+    {
+        auto far = _ram.begin();
+        for (auto it = _ram.begin(); it != _ram.end(); ++it)
+            if (page_dist(it->first, _current_page) > page_dist(far->first, _current_page)) far = it;
+        _ram_bytes -= far->second.bytes;
+        free(far->second.px);
+        _ram.erase(far);
+    }
+}
+
+void CBZPageLayout::ram_clear()
+{
+    for (auto &kv : _ram) free(kv.second.px);
+    _ram.clear();
+    _ram_bytes = 0;
+}
+
+SDL_Texture *CBZPageLayout::ram_texture(int page, int *w, int *h)
+{
+    auto it = _ram.find(page);
+    if (it == _ram.end()) return nullptr;
+    SDL_Texture *t = rgba_to_texture(it->second.px, it->second.w, it->second.h);
+    if (t) { *w = it->second.w; *h = it->second.h; }
+    return t;
+}
+
+// Decodes a page on the calling (main) thread and keeps a copy in RAM.
+SDL_Texture *CBZPageLayout::decode_now(int page, int *w, int *h)
+{
     void *data = nullptr;
-    size_t dsize = 0;
-    if (!extract_image_cached(_archive_path.c_str(),
-                              _pf_page_name[slot], &data, &dsize,
-                              &_pf_cancel[slot]))
-        return;
-
-    if (__atomic_load_n(&_pf_cancel[slot], __ATOMIC_ACQUIRE))
-    {
-        SDL_free(data);
-        return;
-    }
-
-    bool is_jpeg = (dsize >= 2 &&
-                    ((const uint8_t *)data)[0] == 0xFF &&
-                    ((const uint8_t *)data)[1] == 0xD8);
-
-    unsigned char *pixels = nullptr;
-    int w = 0, h = 0;
-
-    if (is_jpeg)
-    {
-        pixels = decode_jpeg_turbo(data, dsize, &w, &h);
-        if (!pixels)
-        {
-            int ch = 0;
-            pixels = stbi_load_from_memory(
-                (const stbi_uc *)data, (int)dsize, &w, &h, &ch, 4);
-        }
-    }
-    else
-    {
-        int ch = 0;
-        pixels = stbi_load_from_memory(
-            (const stbi_uc *)data, (int)dsize, &w, &h, &ch, 4);
-    }
-
+    size_t size = 0;
+    if (!extract_image_cached(_archive_path.c_str(), _page_names[page], &data, &size, nullptr, _is_dir,
+                              _main_cursor))
+        return nullptr;
+    unsigned char *px = decode_rgba(data, size, w, h);
     SDL_free(data);
-
-    if (pixels)
-    {
-        _pf_pixels[slot] = pixels;
-        _pf_w[slot]      = w;
-        _pf_h[slot]      = h;
-        __atomic_store_n(&_pf_ok[slot], true, __ATOMIC_RELEASE);
-    }
+    if (!px) { Log_Error("CBZPageLayout: cannot decode " + _page_names[page]); return nullptr; }
+    if (_invert) InvertLuminance(px, *w, *h, *w * 4, 4);
+    SDL_Texture *t = rgba_to_texture(px, *w, *h);
+    ram_insert(page, px, *w, *h);  // takes ownership
+    return t;
 }
 
-void CBZPageLayout::cancel_one_slot(int i)
+// ── GPU-ready neighbours (N+1, N+2, N-1) ─────────────────────────────────────
+
+int CBZPageLayout::wanted_pages(int *out) const
 {
-    if (!_pf_active[i]) return;
-    __atomic_store_n(&_pf_cancel[i], 1, __ATOMIC_RELEASE);
-    threadWaitForExit(&_pf_thread[i]);
-    threadClose(&_pf_thread[i]);
-    _pf_active[i] = false;
-    if (_pf_pixels[i]) { free(_pf_pixels[i]); _pf_pixels[i] = nullptr; }
-    _pf_page[i] = -1;
+    if (_enumerating || _spread_mode || !_valid) return 0;
+    int n = 0;
+    const int cand[] = {_current_page + 1, _current_page + 2, _current_page - 1};
+    for (int p : cand)
+        if (p >= 0 && p < _page_count) out[n++] = p;
+    return n;
 }
 
-void CBZPageLayout::start_prefetch(int fwd_page, int bwd_page, int fwd2_page)
+bool CBZPageLayout::is_wanted(int page) const
 {
-    typedef void (*ThreadFunc)(void *);
-    static const ThreadFunc entries[N_PF] = {
-        prefetch_entry_0, prefetch_entry_1, prefetch_entry_2
-    };
-    // Cores: slot 0→core 1, slot 1→core 2, slot 2→core 3
-    static const int cores[N_PF] = {1, 2, 2};
+    int w[3];
+    int n = wanted_pages(w);
+    for (int i = 0; i < n; i++)
+        if (w[i] == page) return true;
+    return false;
+}
 
-    // Phase 1: signal all still-active slots to cancel (non-blocking).
-    // Some may already be signaled from the hit/miss path above — that's fine.
-    for (int i = 0; i < N_PF; i++)
-        if (_pf_active[i])
-            __atomic_store_n(&_pf_cancel[i], 1, __ATOMIC_RELEASE);
+int CBZPageLayout::ready_find(int page) const
+{
+    for (int i = 0; i < N_READY; i++)
+        if (_ready[i].tex && _ready[i].page == page) return i;
+    return -1;
+}
 
-    // Phase 2: wait for all active slots to exit, then clean up.
-    // By now the cancel signal has been set for the duration of texture upload
-    // + zoom recalc, so most threads will have already exited.
-    for (int i = 0; i < N_PF; i++)
-    {
-        if (!_pf_active[i]) continue;
-        threadWaitForExit(&_pf_thread[i]);
-        threadClose(&_pf_thread[i]);
-        _pf_active[i] = false;
-        if (_pf_pixels[i]) { free(_pf_pixels[i]); _pf_pixels[i] = nullptr; }
-        _pf_ok[i]   = false;
-        _pf_page[i] = -1;
-    }
+void CBZPageLayout::ready_put(int page, SDL_Texture *tex, int w, int h)
+{
+    int slot = ready_find(page);
+    if (slot < 0)
+        for (int i = 0; i < N_READY && slot < 0; i++)
+            if (!_ready[i].tex) slot = i;
+    if (slot < 0)
+        for (int i = 0; i < N_READY && slot < 0; i++)
+            if (!is_wanted(_ready[i].page)) slot = i;
+    if (slot < 0) { SDL_DestroyTexture(tex); return; }
+    FreeTextureIfNeeded(&_ready[slot].tex);
+    _ready[slot] = {page, tex, w, h};
+}
 
-    // Phase 3: launch new prefetch threads.
-    int pages[N_PF] = {fwd_page, bwd_page, fwd2_page};
-
-    for (int i = 0; i < N_PF; i++)
-    {
-        _pf_page[i]   = pages[i];
-        _pf_page_name[i] = (pages[i] >= 0) ? _page_names[pages[i]] : "";
-        _pf_pixels[i] = nullptr;
-        _pf_w[i]      = 0;
-        _pf_h[i]      = 0;
-        _pf_ok[i]     = false;
-        __atomic_store_n(&_pf_cancel[i], 0, __ATOMIC_RELEASE);
-
-        if (_pf_page[i] < 0) continue;
-        // Skip slot 2: only 2 prefetch threads to avoid SD card I/O contention
-        if (i == 2) continue;
-
-        Result rc = threadCreate(&_pf_thread[i], entries[i], this,
-                                 NULL, 0x80000, 0x30, cores[i]);
-        if (R_SUCCEEDED(rc))
+void CBZPageLayout::ready_prune()
+{
+    for (int i = 0; i < N_READY; i++)
+        if (_ready[i].tex && !is_wanted(_ready[i].page))
         {
-            rc = threadStart(&_pf_thread[i]);
-            if (R_SUCCEEDED(rc))
-                _pf_active[i] = true;
-            else
-            {
-                Log_Error("start_prefetch: threadStart failed slot=" + std::to_string(i));
-                threadClose(&_pf_thread[i]);
-            }
+            FreeTextureIfNeeded(&_ready[i].tex);
+            _ready[i].page = -1;
         }
-        else
-        {
-            Log_Error("start_prefetch: threadCreate failed slot=" + std::to_string(i));
-        }
-    }
-}
-
-void CBZPageLayout::cancel_prefetch()
-{
-    // Signal all first (non-blocking), then wait for all.
-    for (int i = 0; i < N_PF; i++)
-        if (_pf_active[i])
-            __atomic_store_n(&_pf_cancel[i], 1, __ATOMIC_RELEASE);
-    for (int i = 0; i < N_PF; i++)
-        cancel_one_slot(i);
-    free_ready_textures();
-}
-
-void CBZPageLayout::clamp_center()
-{
-    float vw = ((_rotation == 90 && !_tex_r) ? (float)_tex_h : (float)_tex_w) * _zoom;
-    float vh = ((_rotation == 90 && !_tex_r) ? (float)_tex_w : (float)_tex_h) * _zoom;
-    {
-        float cx_lo = std::min(vw / 2.0f, _viewport.w - vw / 2.0f);
-        float cx_hi = std::max(vw / 2.0f, _viewport.w - vw / 2.0f);
-        _cx = std::fmin(std::fmax(_cx, cx_lo), cx_hi);
-    }
-    _cy = std::fmin(std::fmax(_cy, _viewport.h - vh / 2.0f), vh / 2.0f);
-}
-
-void CBZPageLayout::apply_zoom(float v)
-{
-    v = std::fmin(std::fmax(v, _min_zoom), _max_zoom);
-    if (v == _zoom)
-        return;
-    _zoom = v;
-    clamp_center();
 }
 
 void CBZPageLayout::free_ready_textures()
 {
-    FreeTextureIfNeeded(&_ready_next);
-    FreeTextureIfNeeded(&_ready_prev);
-    _ready_next_pg = -1;
-    _ready_prev_pg = -1;
-    _ready_next_w  = 0;
-    _ready_next_h  = 0;
-    _ready_prev_w  = 0;
-    _ready_prev_h  = 0;
+    for (int i = 0; i < N_READY; i++)
+    {
+        FreeTextureIfNeeded(&_ready[i].tex);
+        _ready[i].page = -1;
+    }
 }
 
-void CBZPageLayout::poll_prefetch()
+// Uploads at most one decoded neighbour per frame so the UI never stutters.
+void CBZPageLayout::fill_ready()
 {
-    // Skip in spread mode — prefetch doesn't handle page pairs
-    if (_spread_mode) return;
+    int want[3];
+    int n = wanted_pages(want);
+    for (int k = 0; k < n; k++)
+    {
+        if (ready_find(want[k]) >= 0) continue;
+        int w = 0, h = 0;
+        if (SDL_Texture *t = ram_texture(want[k], &w, &h))
+        {
+            ready_put(want[k], t, w, h);
+            return;
+        }
+    }
+}
 
+// Texture for `page`, fastest source first. Ready textures are handed over.
+SDL_Texture *CBZPageLayout::take_page(int page, int *w, int *h)
+{
+    int r = ready_find(page);
+    if (r >= 0)
+    {
+        SDL_Texture *t = _ready[r].tex;
+        *w = _ready[r].w;
+        *h = _ready[r].h;
+        _ready[r].tex = nullptr;
+        _ready[r].page = -1;
+        return t;
+    }
+    if (SDL_Texture *t = ram_texture(page, w, h)) return t;
     for (int i = 0; i < N_PF; i++)
     {
-        if (!_pf_active[i]) continue;
-        if (!__atomic_load_n(&_pf_ok[i], __ATOMIC_ACQUIRE)) continue;   // decode still running
-
-        // Decode finished — thread is about to exit or already exited.
-        threadWaitForExit(&_pf_thread[i]);   // instant (thread done)
-        threadClose(&_pf_thread[i]);
-        _pf_active[i] = false;
-
-        int pg = _pf_page[i];
-        unsigned char *pixels = _pf_pixels[i];
-        int pw = _pf_w[i];
-        int ph = _pf_h[i];
-        _pf_pixels[i] = nullptr;
-        _pf_page[i]   = -1;
-        _pf_ok[i]     = false;
-
-        if (!pixels) continue;
-
-        // Determine which ready slot this page belongs to
-        bool is_next = (pg == _current_page + 1);
-        bool is_prev = (pg == _current_page - 1);
-
-        // Skip if it doesn't match N+1 or N-1, or if we already have it
-        if (is_next && _ready_next_pg == pg) { free(pixels); continue; }
-        if (is_prev && _ready_prev_pg == pg) { free(pixels); continue; }
-        if (!is_next && !is_prev)            { free(pixels); continue; }
-
-        // Upload to GPU texture
-        SDL_Surface *s = SDL_CreateRGBSurfaceFrom(
-            pixels, pw, ph, 32, pw * 4,
-            0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
-
-        SDL_Texture *tex = nullptr;
-        if (s)
-        {
-            tex = SDL_CreateTextureFromSurface(RENDERER, s);
-            SDL_FreeSurface(s);
-        }
-        free(pixels);
-
-        if (!tex) continue;
-
-        if (is_next)
-        {
-            FreeTextureIfNeeded(&_ready_next);
-            _ready_next    = tex;
-            _ready_next_pg = pg;
-            _ready_next_w  = pw;
-            _ready_next_h  = ph;
-        }
-        else
-        {
-            FreeTextureIfNeeded(&_ready_prev);
-            _ready_prev    = tex;
-            _ready_prev_pg = pg;
-            _ready_prev_w  = pw;
-            _ready_prev_h  = ph;
-        }
+        PfSlot &s = _pf[i];
+        if (!s.active || s.page != page || __atomic_load_n(&s.cancel, __ATOMIC_ACQUIRE)) continue;
+        threadWaitForExit(&s.thread);  // already decoding exactly this page
+        threadClose(&s.thread);
+        s.active = false;
+        reap_slot(i);
+        return ram_texture(page, w, h);
     }
+    return nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// Public interface
-// ---------------------------------------------------------------------------
-
-void CBZPageLayout::previous_page(int n)
+void CBZPageLayout::load_page_texture(int page_num, int anchor)
 {
-    if (!_valid) return;
-    int step = _spread_mode ? 2 * n : n;
-    int new_page = _current_page - step;
-    if (new_page < 0)
-        new_page = 0;
-    if (new_page == _current_page)
+    int limit = nav_limit();
+    if (limit <= 0) return;
+    int target = std::max(0, std::min(page_num, limit - 1));
+    bool do_spread = _spread_mode && target + 1 < limit;
+
+    int w = 0, h = 0;
+    SDL_Texture *t = take_page(target, &w, &h);
+    if (!t) t = decode_now(target, &w, &h);
+    if (!t)
+    {
+        Log_Error("CBZPageLayout: failed to load page " + std::to_string(target));
         return;
-
-    // Try instant swap from ready texture (single-page, step==1 only)
-    if (!_spread_mode && step == 1 &&
-        _ready_prev && _ready_prev_pg == new_page)
-    {
-        // Recycle old current texture as the new _ready_next (instant forward-nav)
-        FreeTextureIfNeeded(&_ready_next);
-        FreeTextureIfNeeded(&_tex_r);
-        _ready_next    = _tex;
-        _ready_next_pg = _current_page;
-        _ready_next_w  = _tex_w;
-        _ready_next_h  = _tex_h;
-
-        _tex     = _ready_prev;
-        _tex_w   = _ready_prev_w;
-        _tex_h   = _ready_prev_h;
-        _tex_r_w = 0;
-
-        _ready_prev    = nullptr;
-        _ready_prev_pg = -1;
-        _ready_prev_w  = 0;
-        _ready_prev_h  = 0;
-
-        _current_page = new_page;
-
-        // Reset zoom for the new page dimensions
-        float eff_w = (_rotation == 90) ? (float)_tex_h : (float)_tex_w;
-        float eff_h = (_rotation == 90) ? (float)_tex_w : (float)_tex_h;
-        _min_zoom = std::min((float)_viewport.w / eff_w,
-                             (float)_viewport.h / eff_h);
-        _max_zoom = std::max((float)_viewport.w / eff_w,
-                             (float)_viewport.h / eff_h) * 2.0f;
-        _max_zoom = std::max(_max_zoom, _min_zoom * 4.0f);
-        _zoom = _min_zoom;
-        _cx   = _viewport.w / 2.0f;
-        _cy   = eff_h * _zoom / 2.0f;
-
-        // Launch new prefetch for N+1 and N-1
-        int pf_limit = _enumerating ? __atomic_load_n(&_enum_count, __ATOMIC_ACQUIRE) : _page_count;
-        int fwd  = (_current_page + 1 < pf_limit) ? _current_page + 1 : -1;
-        int bwd  = (_current_page - 1 >= 0)        ? _current_page - 1 : -1;
-        int fwd2 = (_current_page + 2 < pf_limit)  ? _current_page + 2 : -1;
-        start_prefetch(fwd, bwd, fwd2);
     }
+
+    // Keep the page we are leaving on the GPU: turning back is then instant.
+    int old_page = _current_page;
+    _current_page = target;
+    if (_tex && !_tex_r && !do_spread && old_page != target && is_wanted(old_page))
+        ready_put(old_page, _tex, _tex_cur_w, _tex_h);
     else
-    {
-        // Fallback: blocking load
-        free_ready_textures();
-        load_page_texture(new_page, true);
-    }
+        FreeTextureIfNeeded(&_tex);
+    _tex = nullptr;
+    FreeTextureIfNeeded(&_tex_r);
 
-    if (_enumerating)
-        _enum_current_name = _page_names[_current_page];
+    _tex = t;
+    _tex_w = _tex_cur_w = w;
+    _tex_h = h;
+    if (do_spread)
+    {
+        int rw = 0, rh = 0;
+        _tex_r = ram_texture(target + 1, &rw, &rh);
+        if (!_tex_r) _tex_r = decode_now(target + 1, &rw, &rh);
+        if (_tex_r && rh > 0 && h > 0)
+        {
+            int H = std::max(h, rh);
+            _tex_cur_w = (int)lroundf(w * (float)H / h);
+            _tex_w = _tex_cur_w + (int)lroundf(rw * (float)H / rh);
+            _tex_h = H;
+        }
+    }
+    apply_dims(anchor);
+    ram_prune();
+    ready_prune();
+    pf_schedule();
 }
+
+void CBZPageLayout::reload_current()
+{
+    if (_enumerating || !_valid) return;
+    cancel_prefetch();
+    ram_clear();
+    FreeTextureIfNeeded(&_tex);
+    FreeTextureIfNeeded(&_tex_r);
+    int p = _current_page;
+    _current_page = -1;
+    load_page_texture(p, ANCHOR_TOP);
+}
+
+// ---------------------------------------------------------------------------
+// Background decoders: fill the RAM cache outward from the current page
+// ---------------------------------------------------------------------------
+
+void CBZPageLayout::prefetch_entry_0(void *arg) { ((CBZPageLayout *)arg)->do_prefetch(0); }
+void CBZPageLayout::prefetch_entry_1(void *arg) { ((CBZPageLayout *)arg)->do_prefetch(1); }
+
+void CBZPageLayout::do_prefetch(int i)
+{
+    PfSlot &s = _pf[i];
+    void *data = nullptr;
+    size_t size = 0;
+    if (!__atomic_load_n(&s.cancel, __ATOMIC_ACQUIRE) &&
+        extract_image_cached(_archive_path.c_str(), s.name, &data, &size, &s.cancel, _is_dir,
+                             s.cursor))
+    {
+        if (!__atomic_load_n(&s.cancel, __ATOMIC_ACQUIRE))
+        {
+            int w = 0, h = 0;
+            unsigned char *px = decode_rgba(data, size, &w, &h);
+            if (px && s.invert) InvertLuminance(px, w, h, w * 4, 4);
+            s.px = px;
+            s.w = w;
+            s.h = h;
+        }
+        SDL_free(data);
+    }
+    __atomic_store_n(&s.done, 1, __ATOMIC_RELEASE);
+}
+
+// Moves a finished (already joined) slot's pixels into the RAM cache.
+void CBZPageLayout::reap_slot(int i)
+{
+    PfSlot &s = _pf[i];
+    if (s.px && s.invert == _invert && !__atomic_load_n(&s.cancel, __ATOMIC_ACQUIRE))
+        ram_insert(s.page, s.px, s.w, s.h);  // takes ownership
+    else
+        free(s.px);
+    s.px = nullptr;
+    s.page = -1;
+}
+
+void CBZPageLayout::pf_reap()
+{
+    for (int i = 0; i < N_PF; i++)
+    {
+        PfSlot &s = _pf[i];
+        if (!s.active || !__atomic_load_n(&s.done, __ATOMIC_ACQUIRE)) continue;
+        threadWaitForExit(&s.thread);
+        threadClose(&s.thread);
+        s.active = false;
+        reap_slot(i);
+    }
+}
+
+void CBZPageLayout::pf_schedule()
+{
+    static void (*const entries[N_PF])(void *) = {prefetch_entry_0, prefetch_entry_1};
+    static const int cores[N_PF] = {1, 2};
+
+    for (int i = 0; i < N_PF; i++)
+        if (_pf[i].active && _pf[i].invert != _invert)
+            __atomic_store_n(&_pf[i].cancel, 1, __ATOMIC_RELEASE);
+
+    static int order[4096];
+    int n = fill_order(order, 4096);
+    size_t avg = _ram.empty() ? (size_t)8 << 20 : _ram_bytes / _ram.size();
+    int in_flight = 0;
+    for (int i = 0; i < N_PF; i++)
+        if (_pf[i].active) in_flight++;
+
+    // Distance of the farthest cached page: anything nearer may replace it.
+    int far = -1;
+    for (auto &kv : _ram) far = std::max(far, page_dist(kv.first, _current_page));
+
+    for (int k = 0; k < n; k++)
+    {
+        int page = order[k];
+        if (_ram.count(page) || ready_find(page) >= 0) continue;
+        bool busy = false;
+        for (int i = 0; i < N_PF; i++)
+            if (_pf[i].active && _pf[i].page == page) busy = true;
+        if (busy) continue;
+        bool room = _ram_bytes + (size_t)(in_flight + 1) * avg <= page_budget();
+        if (!room && page_dist(page, _current_page) >= far) return;  // cache is full of nearer pages
+        int idle = -1;
+        for (int i = 0; i < N_PF && idle < 0; i++)
+            if (!_pf[i].active) idle = i;
+        if (idle < 0) return;
+        PfSlot &s = _pf[idle];
+        s.page = page;
+        s.name = _page_names[page];
+        s.invert = _invert;
+        s.px = nullptr;
+        s.w = s.h = 0;
+        __atomic_store_n(&s.cancel, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&s.done, 0, __ATOMIC_RELEASE);
+        if (R_FAILED(threadCreate(&s.thread, entries[idle], this, nullptr, 0x80000, 0x30, cores[idle])))
+            return;
+        if (R_FAILED(threadStart(&s.thread)))
+        {
+            threadClose(&s.thread);
+            return;
+        }
+        s.active = true;
+        in_flight++;
+    }
+}
+
+// Blocking: used on teardown and when every decoded page becomes invalid.
+void CBZPageLayout::cancel_prefetch()
+{
+    for (int i = 0; i < N_PF; i++)
+        if (_pf[i].active) __atomic_store_n(&_pf[i].cancel, 1, __ATOMIC_RELEASE);
+    for (int i = 0; i < N_PF; i++)
+    {
+        PfSlot &s = _pf[i];
+        if (s.active)
+        {
+            threadWaitForExit(&s.thread);
+            threadClose(&s.thread);
+            s.active = false;
+        }
+        free(s.px);
+        s.px = nullptr;
+        s.page = -1;
+    }
+    free_ready_textures();
+}
+
+bool CBZPageLayout::poll()
+{
+    bool changed = false;
+    if (_enumerating)
+    {
+        if (!_valid && __atomic_load_n(&_first_image_ready, __ATOMIC_ACQUIRE) && _first_image_raw)
+        {
+            apply_first_image();
+            changed = true;
+        }
+        if (__atomic_load_n(&_enum_done, __ATOMIC_ACQUIRE))
+        {
+            finish_enumeration();
+            changed = true;
+        }
+        return changed;
+    }
+    pf_reap();
+    ram_prune();
+    ready_prune();
+    fill_ready();
+    pf_schedule();
+    return changed;
+}
+
+// ---------------------------------------------------------------------------
+// Navigation
+// ---------------------------------------------------------------------------
 
 void CBZPageLayout::next_page(int n)
 {
-    if (!_valid) return;
-    int step = _spread_mode ? 2 * n : n;
-    int new_page = _current_page + step;
-    int limit = _enumerating ? __atomic_load_n(&_enum_count, __ATOMIC_ACQUIRE) : _page_count;
-    if (new_page >= limit)
-        return;
+    if (!_valid || _enumerating) return;
+    int target = _current_page + (_spread_mode ? 2 * n : n);
+    if (target >= _page_count) return;
+    load_page_texture(target, ANCHOR_TOP);
+}
 
-    // Try instant swap from ready texture (single-page, step==1 only)
-    if (!_spread_mode && step == 1 &&
-        _ready_next && _ready_next_pg == new_page)
-    {
-        // Recycle old current texture as the new _ready_prev (instant back-nav)
-        FreeTextureIfNeeded(&_ready_prev);
-        FreeTextureIfNeeded(&_tex_r);
-        _ready_prev    = _tex;
-        _ready_prev_pg = _current_page;
-        _ready_prev_w  = _tex_w;
-        _ready_prev_h  = _tex_h;
-
-        _tex     = _ready_next;
-        _tex_w   = _ready_next_w;
-        _tex_h   = _ready_next_h;
-        _tex_r_w = 0;
-
-        _ready_next    = nullptr;
-        _ready_next_pg = -1;
-        _ready_next_w  = 0;
-        _ready_next_h  = 0;
-
-        _current_page = new_page;
-
-        // Reset zoom for the new page dimensions
-        float eff_w = (_rotation == 90) ? (float)_tex_h : (float)_tex_w;
-        float eff_h = (_rotation == 90) ? (float)_tex_w : (float)_tex_h;
-        _min_zoom = std::min((float)_viewport.w / eff_w,
-                             (float)_viewport.h / eff_h);
-        _max_zoom = std::max((float)_viewport.w / eff_w,
-                             (float)_viewport.h / eff_h) * 2.0f;
-        _max_zoom = std::max(_max_zoom, _min_zoom * 4.0f);
-        _zoom = _min_zoom;
-        _cx   = _viewport.w / 2.0f;
-        _cy   = eff_h * _zoom / 2.0f;
-
-        // Launch new prefetch for N+1 and N-1
-        int pf_limit = _enumerating ? __atomic_load_n(&_enum_count, __ATOMIC_ACQUIRE) : _page_count;
-        int fwd  = (_current_page + 1 < pf_limit) ? _current_page + 1 : -1;
-        int bwd  = (_current_page - 1 >= 0)        ? _current_page - 1 : -1;
-        int fwd2 = (_current_page + 2 < pf_limit)  ? _current_page + 2 : -1;
-        start_prefetch(fwd, bwd, fwd2);
-    }
-    else
-    {
-        // Fallback: blocking load (spread mode, multi-step skip, or no ready texture)
-        free_ready_textures();
-        load_page_texture(new_page, true);
-    }
-
-    if (_enumerating)
-        _enum_current_name = _page_names[_current_page];
+void CBZPageLayout::previous_page(int n)
+{
+    if (!_valid || _enumerating) return;
+    int target = std::max(0, _current_page - (_spread_mode ? 2 * n : n));
+    if (target == _current_page) return;
+    load_page_texture(target, ANCHOR_TOP);
 }
 
 void CBZPageLayout::goto_page(int num)
 {
-    if (!_valid) return;
-    int limit = _enumerating ? __atomic_load_n(&_enum_count, __ATOMIC_ACQUIRE) : _page_count;
-    if (limit <= 0) return;
-    int target = std::min(std::max(0, num), limit - 1);
-    if (target == _current_page)
+    if (_enumerating) { _start_page = num; return; }
+    if (!_valid || _page_count <= 0) return;
+    int target = std::max(0, std::min(num, _page_count - 1));
+    if (target == _current_page) { apply_dims(ANCHOR_TOP); return; }
+    load_page_texture(target, ANCHOR_TOP);
+}
+
+void CBZPageLayout::set_viewport(SDL_Rect vp)
+{
+    _view.set_viewport(vp.x, vp.y, vp.w, vp.h);
+    if (_tex) apply_dims(ANCHOR_TOP);
+}
+
+void CBZPageLayout::set_fit(int fit)
+{
+    _view.fit = fit;
+    if (_tex) apply_dims(ANCHOR_TOP);
+}
+
+void CBZPageLayout::set_invert(bool invert)
+{
+    if (invert == _invert) return;
+    _invert = invert;
+    reload_current();
+}
+
+void CBZPageLayout::set_spread(bool on)
+{
+    if (on == _spread_mode) return;
+    _spread_mode = on;
+    reload_current();
+}
+
+void CBZPageLayout::draw()
+{
+    if (!_tex) return;
+    SDL_Rect r = _view.rect();
+    if (!_tex_r)
+    {
+        SDL_RenderCopy(RENDERER, _tex, nullptr, &r);
         return;
-    free_ready_textures();
-    load_page_texture(target, true);
-    if (_enumerating)
-        _enum_current_name = _page_names[_current_page];
-}
-
-void CBZPageLayout::toggle_spread()
-{
-    // Y cycles: single(0°) → single(90°) → spread → single(0°)
-    if (!_spread_mode && _rotation == 0)
-    {
-        _rotation = 90;
     }
-    else if (!_spread_mode && _rotation == 90)
-    {
-        _rotation    = 0;
-        _spread_mode = true;
-    }
-    else
-    {
-        _spread_mode = false;
-    }
-    free_ready_textures();
-    load_page_texture(_current_page, true);
-}
-
-void CBZPageLayout::zoom_in(float zoom_amount)  { apply_zoom(_zoom + zoom_amount); }
-void CBZPageLayout::zoom_out(float zoom_amount) { apply_zoom(_zoom - zoom_amount); }
-
-void CBZPageLayout::zoom_at_point(float delta, float px, float py)
-{
-    float old_zoom = _zoom;
-    float new_zoom = std::fmin(std::fmax(old_zoom + delta, _min_zoom), _max_zoom);
-    if (new_zoom == old_zoom)
-        return;
-    float ratio = new_zoom / old_zoom;
-    _cx = px + (_cx - px) * ratio;
-    _cy = py + (_cy - py) * ratio;
-    _zoom = new_zoom;
-    clamp_center();
-}
-
-void CBZPageLayout::zoom_max()
-{
-    apply_zoom(_max_zoom);
-    apply_zoom(_zoom - 0.6f);
-    apply_zoom(_zoom + 0.6f);
-}
-
-void CBZPageLayout::move_up(int scroll_speed)
-{
-    float eff_h = ((_rotation == 90 && !_tex_r) ? (float)_tex_w : (float)_tex_h);
-    float h = eff_h * _zoom;
-    _cy = std::fmin(std::fmax(_cy + scroll_speed, _viewport.h - h / 2.0f), h / 2.0f);
-}
-
-void CBZPageLayout::move_down(int scroll_speed)
-{
-    float eff_h = ((_rotation == 90 && !_tex_r) ? (float)_tex_w : (float)_tex_h);
-    float h = eff_h * _zoom;
-    _cy = std::fmin(std::fmax(_cy - scroll_speed, _viewport.h - h / 2.0f), h / 2.0f);
-}
-
-void CBZPageLayout::move_left(int scroll_speed)
-{
-    float eff_w = ((_rotation == 90 && !_tex_r) ? (float)_tex_h : (float)_tex_w);
-    float w  = eff_w * _zoom;
-    float lo = std::min(w / 2.0f, _viewport.w - w / 2.0f);
-    float hi = std::max(w / 2.0f, _viewport.w - w / 2.0f);
-    _cx = std::fmin(std::fmax(_cx - scroll_speed, lo), hi);
-}
-
-void CBZPageLayout::move_right(int scroll_speed)
-{
-    float eff_w = ((_rotation == 90 && !_tex_r) ? (float)_tex_h : (float)_tex_w);
-    float w  = eff_w * _zoom;
-    float lo = std::min(w / 2.0f, _viewport.w - w / 2.0f);
-    float hi = std::max(w / 2.0f, _viewport.w - w / 2.0f);
-    _cx = std::fmin(std::fmax(_cx + scroll_speed, lo), hi);
-}
-
-void CBZPageLayout::reset()
-{
-    _cx = _viewport.w / 2.0f;
-    _cy = _viewport.h / 2.0f;
-    apply_zoom(_min_zoom);
-}
-
-void CBZPageLayout::draw_page()
-{
-    if (!_tex)
-        return;
-
-    if (_rotation == 90 && !_tex_r)
-    {
-        // Use the ORIGINAL texture dimensions for dstrect — SDL rotates the rect
-        // itself, preserving aspect ratio. Swapping w/h here would stretch the texture.
-        float vw = _tex_w * _zoom;
-        float vh = _tex_h * _zoom;
-        SDL_Rect dst = {(int)(_cx - vw / 2.0f), (int)(_cy - vh / 2.0f),
-                        (int)vw, (int)vh};
-        SDL_RenderCopyEx(RENDERER, _tex, NULL, &dst, 90.0, NULL, SDL_FLIP_NONE);
-    }
-    else if (_tex_r)
-    {
-        // Spread: render left and right textures side-by-side
-        float total_w = _tex_w * _zoom;
-        float total_h = _tex_h * _zoom;
-        float left_x  = _cx - total_w / 2.0f;
-        float top_y   = _cy - total_h / 2.0f;
-        float left_w  = (_tex_w - _tex_r_w) * _zoom;
-
-        int rx = (int)(left_x + left_w);  // right edge from float, no gap
-        SDL_Rect dst_l = {(int)left_x, (int)top_y, rx - (int)left_x, (int)total_h};
-        SDL_Rect dst_r = {rx,          (int)top_y, (int)(left_x + total_w) - rx, (int)total_h};
-        SDL_RenderCopy(RENDERER, _tex,   NULL, &dst_l);
-        SDL_RenderCopy(RENDERER, _tex_r, NULL, &dst_r);
-    }
-    else
-    {
-        float total_w = _tex_w * _zoom;
-        float total_h = _tex_h * _zoom;
-        SDL_Rect dst = {(int)(_cx - total_w / 2.0f), (int)(_cy - total_h / 2.0f),
-                        (int)total_w, (int)total_h};
-        SDL_RenderCopy(RENDERER, _tex, NULL, &dst);
-    }
-}
-
-char *CBZPageLayout::info()
-{
-    if (_enumerating)
-    {
-        if (_tex_r)
-            snprintf(_info_buf, sizeof(_info_buf), "%d-%d/?, %.0f%%",
-                     _current_page + 1, _current_page + 2, _zoom * 100.0f);
-        else
-            snprintf(_info_buf, sizeof(_info_buf), "%d/?, %.0f%%",
-                     _current_page + 1, _zoom * 100.0f);
-    }
-    else if (_tex_r)
-        snprintf(_info_buf, sizeof(_info_buf), "%d-%d/%d, %.0f%%",
-                 _current_page + 1, _current_page + 2, _page_count, _zoom * 100.0f);
-    else
-        snprintf(_info_buf, sizeof(_info_buf), "%d/%d, %.0f%%",
-                 _current_page + 1, _page_count, _zoom * 100.0f);
-    return _info_buf;
+    // Two-page spread: page order follows the reading direction.
+    float sc = (float)r.w / (float)_tex_w;
+    int cur_w = (int)lroundf(_tex_cur_w * sc);
+    SDL_Texture *left = _rtl ? _tex_r : _tex;
+    SDL_Texture *right = _rtl ? _tex : _tex_r;
+    int left_w = _rtl ? r.w - cur_w : cur_w;
+    SDL_Rect dl = {r.x, r.y, left_w, r.h};
+    SDL_Rect dr = {r.x + left_w, r.y, r.w - left_w, r.h};
+    SDL_RenderCopy(RENDERER, left, nullptr, &dl);
+    SDL_RenderCopy(RENDERER, right, nullptr, &dr);
 }
